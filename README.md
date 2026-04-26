@@ -7,6 +7,12 @@ Where `rep` rewrites file *contents*, `ren` rewrites file *names*. Plain and reg
 ## Install
 
 ```shell
+brew install gechr/tap/ren
+```
+
+Or with Cargo:
+
+```shell
 cargo install --git https://github.com/gechr/ren
 ```
 
