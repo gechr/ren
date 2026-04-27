@@ -7,16 +7,18 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::process::{Command, Stdio};
 
-use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt as _;
+use assert_cmd::cargo::CommandCargoExt as _;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-/// Convenience: build a `Command` that invokes the `ren` binary with `cwd`
-/// set to the given temp dir. All arguments are passed as `&str`.
+/// `ren` binary cwd-set to `dir`. Stdin is nulled so `ren`'s auto-detection
+/// doesn't trip on the FIFO that `assert_cmd::Command` would attach.
 fn ren(dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("ren").expect("ren binary built by cargo");
-    cmd.current_dir(dir.path());
+    cmd.current_dir(dir.path()).stdin(Stdio::null());
     cmd
 }
 
@@ -306,4 +308,61 @@ fn multiple_expressions_apply_in_order_in_one_pass() {
 
     assert!(dir.path().join("bar_qux.txt").exists());
     assert!(!dir.path().join("foo_baz.txt").exists());
+}
+
+/// `assert_cmd::Command` variant for `write_stdin`-using tests, which need
+/// the wrapper's automatic `Stdio::piped()` on stdin.
+fn ren_stdin(dir: &TempDir) -> assert_cmd::Command {
+    let mut cmd = Command::cargo_bin("ren").expect("ren binary built by cargo");
+    cmd.current_dir(dir.path());
+    assert_cmd::Command::from_std(cmd)
+}
+
+#[test]
+fn stdin_mode_reads_newline_separated_paths() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo_a.txt"), "").unwrap();
+    fs::write(dir.path().join("foo_b.txt"), "").unwrap();
+    // Omitted from stdin: must NOT be touched even though a cwd walk would match.
+    fs::write(dir.path().join("foo_skip.txt"), "").unwrap();
+
+    ren_stdin(&dir)
+        .args(["foo", "bar"])
+        .write_stdin("foo_a.txt\nfoo_b.txt\n")
+        .assert()
+        .success();
+
+    assert!(dir.path().join("bar_a.txt").exists());
+    assert!(dir.path().join("bar_b.txt").exists());
+    assert!(dir.path().join("foo_skip.txt").exists());
+}
+
+#[test]
+fn stdin_mode_with_null_splits_on_nul() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo_a.txt"), "").unwrap();
+    fs::write(dir.path().join("foo_b.txt"), "").unwrap();
+
+    ren_stdin(&dir)
+        .args(["-0", "foo", "bar"])
+        .write_stdin("foo_a.txt\0foo_b.txt\0")
+        .assert()
+        .success();
+
+    assert!(dir.path().join("bar_a.txt").exists());
+    assert!(dir.path().join("bar_b.txt").exists());
+}
+
+#[test]
+fn null_with_explicit_paths_errors() {
+    // `-0` only makes sense when reading from stdin. With an explicit path, we
+    // bail rather than silently ignoring the flag.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["-0", "foo", "bar", "."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--null"));
 }

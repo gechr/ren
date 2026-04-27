@@ -1,4 +1,5 @@
 mod expressions;
+mod io;
 mod preview;
 mod rename;
 mod scan;
@@ -29,6 +30,11 @@ struct Cli {
     /// File glob patterns
     #[arg(short = 'f', long = "files")]
     files: Option<String>,
+
+    /// Read NUL-separated filenames from stdin (else newline-separated).
+    /// Stdin is consumed when no `<path>…` is given and stdin is piped.
+    #[arg(short = '0', long = "null")]
+    null: bool,
 
     /// Include hidden files
     #[arg(short = 'H', long = "hidden")]
@@ -175,6 +181,7 @@ fn print_help() {
 
   {red}-f{reset}, {red}--files {dim}<glob>{reset}        Smart glob patterns to match files against
   {red}-H{reset}, {red}--hidden{reset}              Include hidden files and directories
+  {red}-0{reset}, {red}--null{reset}                Read NUL-separated filenames from stdin
 
 {yellow}{bold}Replace{reset}
 
@@ -278,6 +285,12 @@ fn print_help_long() {
 
   {grey}# Apply multiple replacements in a single pass{reset}
   {green}${reset} ren -e foo bar -e baz qux
+
+  {grey}# Read filenames from a pipeline (auto-detected when no path is given){reset}
+  {green}${reset} fd -t f '\\.tmp$' | ren .tmp .bak
+
+  {grey}# NUL-separated for paths with newlines or odd characters{reset}
+  {green}${reset} fd -t f -0 | ren -0 foo bar
 
   {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart default){reset}
   {green}${reset} ren --counter
@@ -710,10 +723,19 @@ fn run() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Validate paths exist
-    for dir in &cli.dirs() {
-        if !std::path::Path::new(dir).exists() {
-            bail!("{dir}: no such file or directory");
+    let no_positional_paths = cli.args.len() <= cli.positional_skip();
+    let from_stdin = no_positional_paths && io::stdin_has_input();
+
+    if cli.null && !from_stdin {
+        bail!("--null requires reading filenames from stdin");
+    }
+
+    // Validate paths exist (only when walking the filesystem).
+    if !from_stdin {
+        for dir in &cli.dirs() {
+            if !std::path::Path::new(dir).exists() {
+                bail!("{dir}: no such file or directory");
+            }
         }
     }
 
@@ -734,14 +756,18 @@ fn run() -> Result<()> {
         transforms::validate_counter_template(t)?;
     }
 
-    let records = scan::walk_paths(
-        cli.dirs(),
-        cli.file_set(),
-        cli.hidden,
-        cli.no_ignore,
-        cli.recursive,
-        cli.include_dirs,
-    );
+    let records = if from_stdin {
+        io::records_from_paths(io::read_paths_from_stdin(cli.null)?)
+    } else {
+        scan::walk_paths(
+            cli.dirs(),
+            cli.file_set(),
+            cli.hidden,
+            cli.no_ignore,
+            cli.recursive,
+            cli.include_dirs,
+        )
+    };
 
     if cli.list_files {
         // Iterate records, print each whose basename matches at least one
