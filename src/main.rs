@@ -200,6 +200,7 @@ fn print_help() {
 
   {red}-L{reset}, {red}--lower{reset}               Lowercase names
   {red}-U{reset}, {red}--upper{reset}               Uppercase names
+
   {red}-P{reset}, {red}--prepend {dim}<fmt>{reset}       Prepend a string or template
   {red}-A{reset}, {red}--append {dim}<fmt>{reset}        Append a string or template
 
