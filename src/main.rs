@@ -637,21 +637,66 @@ fn with_commas(n: usize) -> String {
     format_count(n, &loc)
 }
 
-fn summary_message_with_formatter<F>(total_files: usize, dry: bool, format_count: F) -> String
+fn summary_message_with_formatter<F>(
+    files: usize,
+    dirs: usize,
+    dry: bool,
+    format_count: F,
+) -> String
 where
     F: Fn(usize) -> String,
 {
     let verb = if dry { "Would rename" } else { "Renamed" };
-    format!(
-        "{} {} item{}",
-        verb,
-        format_count(total_files),
-        if total_files == 1 { "" } else { "s" },
-    )
+    let file_part = (files > 0).then(|| {
+        format!(
+            "{} file{}",
+            format_count(files),
+            if files == 1 { "" } else { "s" },
+        )
+    });
+    let dir_part = (dirs > 0).then(|| {
+        format!(
+            "{} director{}",
+            format_count(dirs),
+            if dirs == 1 { "y" } else { "ies" },
+        )
+    });
+    let body = match (file_part, dir_part) {
+        (Some(f), Some(d)) => format!("{f} and {d}"),
+        (Some(f), None) => f,
+        (None, Some(d)) => d,
+        // Caller suppresses the summary when the plan is empty, but keep a
+        // sensible fallback so the function is total.
+        (None, None) => format!("{} items", format_count(0)),
+    };
+    format!("{verb} {body}")
 }
 
-fn summary_message(total_files: usize, dry: bool) -> String {
-    summary_message_with_formatter(total_files, dry, with_commas)
+fn summary_message(files: usize, dirs: usize, dry: bool) -> String {
+    summary_message_with_formatter(files, dirs, dry, with_commas)
+}
+
+/// Classify each plan entry as file or directory by stat'ing whichever side of
+/// the rename currently exists. `print_summary` runs both before apply (dry
+/// run, `old` exists) and after (`new` exists); rename preserves file type, so
+/// either side answers the question. Symlinks count as files.
+fn count_files_and_dirs(plan: &[PlanEntry]) -> (usize, usize) {
+    let mut files = 0;
+    let mut dirs = 0;
+    for entry in plan {
+        let is_dir = entry
+            .new
+            .symlink_metadata()
+            .or_else(|_| entry.old.symlink_metadata())
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            dirs += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (files, dirs)
 }
 
 /// Print plan rows + summary. `dry` uses yellow "Would rename", otherwise green
@@ -672,7 +717,8 @@ fn print_summary(plan: &[PlanEntry], dry: bool) {
     }
 
     if total_files > 0 {
-        let msg = summary_message(total_files, dry);
+        let (files, dirs) = count_files_and_dirs(plan);
+        let msg = summary_message(files, dirs, dry);
         if stdout_tty {
             let color = if dry { "\x1b[33m" } else { "\x1b[32m" };
             println!("\n\x1b[1m{color}{msg}\x1b[m");
@@ -1196,35 +1242,62 @@ mod tests {
 
     #[test]
     fn test_summary_message_singular_renamed() {
-        assert_eq!(summary_message(1, false), "Renamed 1 item");
+        assert_eq!(summary_message(1, 0, false), "Renamed 1 file");
+        assert_eq!(summary_message(0, 1, false), "Renamed 1 directory");
     }
 
     #[test]
     fn test_summary_message_plural_renamed() {
-        assert_eq!(summary_message(5, false), "Renamed 5 items");
+        assert_eq!(summary_message(5, 0, false), "Renamed 5 files");
+        assert_eq!(summary_message(0, 3, false), "Renamed 3 directories");
     }
 
     #[test]
     fn test_summary_message_dry_run_uses_would_rename() {
-        assert_eq!(summary_message(1, true), "Would rename 1 item");
-        assert_eq!(summary_message(7, true), "Would rename 7 items");
+        assert_eq!(summary_message(1, 0, true), "Would rename 1 file");
+        assert_eq!(summary_message(7, 0, true), "Would rename 7 files");
+        assert_eq!(summary_message(0, 1, true), "Would rename 1 directory");
+        assert_eq!(summary_message(0, 4, true), "Would rename 4 directories");
+    }
+
+    #[test]
+    fn test_summary_message_combines_files_and_dirs() {
+        assert_eq!(
+            summary_message(9, 2, true),
+            "Would rename 9 files and 2 directories"
+        );
+        assert_eq!(
+            summary_message(1, 1, true),
+            "Would rename 1 file and 1 directory"
+        );
+        assert_eq!(
+            summary_message(2, 1, false),
+            "Renamed 2 files and 1 directory"
+        );
     }
 
     #[test]
     fn test_summary_message_large_counts_use_thousands_separators() {
         assert_eq!(
-            summary_message_with_formatter(1_000, false, |n| format_count(
+            summary_message_with_formatter(1_000, 0, false, |n| format_count(
                 n,
                 &num_format::Locale::en
             )),
-            "Renamed 1,000 items"
+            "Renamed 1,000 files"
         );
         assert_eq!(
-            summary_message_with_formatter(2_500_000, true, |n| format_count(
+            summary_message_with_formatter(2_500_000, 0, true, |n| format_count(
                 n,
                 &num_format::Locale::en
             )),
-            "Would rename 2,500,000 items"
+            "Would rename 2,500,000 files"
+        );
+        assert_eq!(
+            summary_message_with_formatter(1_000, 25, true, |n| format_count(
+                n,
+                &num_format::Locale::en
+            )),
+            "Would rename 1,000 files and 25 directories"
         );
     }
 
