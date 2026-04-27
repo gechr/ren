@@ -354,6 +354,45 @@ fn stdin_mode_with_null_splits_on_nul() {
 }
 
 #[test]
+fn create_dirs_makes_missing_parents_for_regex_target() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.log"), "").unwrap();
+    fs::write(dir.path().join("b.log"), "").unwrap();
+
+    ren(&dir)
+        .args([
+            "--create-dirs",
+            "-x",
+            "--regex",
+            r"^(.*)\.log$",
+            "logs/$1.log",
+            ".",
+        ])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("logs").is_dir());
+    assert!(dir.path().join("logs/a.log").exists());
+    assert!(dir.path().join("logs/b.log").exists());
+    assert!(!dir.path().join("a.log").exists());
+}
+
+#[test]
+fn missing_parent_without_create_dirs_fails_and_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.log"), "").unwrap();
+
+    ren(&dir)
+        .args(["-x", "--regex", r"^(.*)\.log$", "logs/$1.log", "."])
+        .assert()
+        .failure();
+
+    // Rollback restores the original file; no `logs/` directory was created.
+    assert!(dir.path().join("a.log").exists());
+    assert!(!dir.path().join("logs").exists());
+}
+
+#[test]
 fn null_with_explicit_paths_errors() {
     // `-0` only makes sense when reading from stdin. With an explicit path, we
     // bail rather than silently ignoring the flag.

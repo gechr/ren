@@ -8,7 +8,7 @@ mod transforms;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{CommandFactory as _, Parser};
 use clap_complete::Shell;
 
@@ -143,6 +143,10 @@ struct Cli {
     #[arg(short = 'p', long = "preview")]
     preview: bool,
 
+    /// Create missing parent directories for rename targets.
+    #[arg(long = "create-dirs")]
+    create_dirs: bool,
+
     #[arg(long = "completions", value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
 }
@@ -211,6 +215,8 @@ fn print_help() {
   {red}-c{reset}, {red}--counter {dim}[<fmt>]{reset}     Prepend counter
 
 {yellow}{bold}Behavior{reset}
+
+      {red}--create-dirs{reset}         Create missing parent directories
 
   {red}-l{reset}, {red}--list-files{reset}          Print only file paths whose names match
 
@@ -291,6 +297,9 @@ fn print_help_long() {
 
   {grey}# NUL-separated for paths with newlines or odd characters{reset}
   {green}${reset} fd -t f -0 | ren -0 foo bar
+
+  {grey}# Move into new subdirectories, creating parents as needed{reset}
+  {green}${reset} ren --create-dirs --regex '^(.*)\\.log$' 'logs/$1.log'
 
   {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart default){reset}
   {green}${reset} ren --counter
@@ -673,6 +682,22 @@ fn print_summary(plan: &[PlanEntry], dry: bool) {
     }
 }
 
+/// Create any missing parent directories for the plan's `new` paths. Called
+/// just before `apply_plan` when `--create-dirs` is set.
+fn create_missing_parents(plan: &[PlanEntry]) -> Result<()> {
+    for entry in plan {
+        let Some(parent) = entry.new.parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() || parent.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 fn print_error(err: &anyhow::Error) {
     if std::io::stderr().is_terminal() {
         eprintln!("\x1b[1;31merror:\x1b[m {err}");
@@ -813,6 +838,9 @@ fn run() -> Result<()> {
         if cli.dry_run {
             print_summary(&accepted, true);
         } else {
+            if cli.create_dirs {
+                create_missing_parents(&accepted)?;
+            }
             apply_plan(&accepted)?;
             print_summary(&accepted, false);
         }
@@ -824,6 +852,9 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if cli.create_dirs {
+        create_missing_parents(&plan)?;
+    }
     apply_plan(&plan)?;
     print_summary(&plan, false);
     Ok(())
