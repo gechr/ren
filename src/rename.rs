@@ -134,21 +134,30 @@ fn split_stem_ext(basename: &str) -> (&str, Option<&str>) {
 /// preserves the stem. See `ExtensionScope` for the precise semantics.
 ///
 /// The transform pipeline runs after find/replace in fixed canonical order
-/// (see `transforms::apply`). When `counter_template` is set, the counter
-/// resets per parent directory and increments only for entries that actually
-/// land in the plan.
+/// (see `transforms::apply`). When `--prepend` or `--append` references the
+/// counter (`{n}`, `{n:0W}`, or `{N}`), the counter resets per parent
+/// directory and increments only for entries that actually land in the plan;
+/// both affixes share the same per-record value.
 pub(crate) fn build_plan(
     records: &[scan::PathRecord],
     exprs: &[expressions::CompiledExpression],
     scope: ExtensionScope,
     transforms_opts: &transforms::TransformOptions,
-    counter_template: Option<&str>,
 ) -> Vec<PlanEntry> {
     let mut plan = Vec::with_capacity(records.len());
     let mut dir_counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
     let mut dir_indices: BTreeMap<PathBuf, usize> = BTreeMap::new();
 
-    if counter_template == Some(transforms::SMART_COUNTER_TEMPLATE) {
+    let uses_counter = transforms_opts
+        .prepend
+        .as_deref()
+        .is_some_and(transforms::has_counter_placeholder)
+        || transforms_opts
+            .append
+            .as_deref()
+            .is_some_and(transforms::has_counter_placeholder);
+
+    if uses_counter {
         for record in records {
             if record.path.file_name().and_then(|n| n.to_str()).is_some() {
                 *dir_counts.entry(parent_key(&record.path)).or_default() += 1;
@@ -203,21 +212,13 @@ pub(crate) fn build_plan(
         }
 
         let (after_expr, _) = expressions::apply_to_basename(working_input, exprs);
-        let mut after_transforms = transforms::apply(&after_expr, transforms_opts);
-
-        if let Some(template) = counter_template {
-            let template = if template == transforms::SMART_COUNTER_TEMPLATE {
-                let dir_entry_count = dir_counts.get(&parent).copied().unwrap_or(0);
-                transforms::smart_counter_template(dir_entry_count)
-            } else {
-                template.to_string()
-            };
-            let counter_value = dir_indices.get(&parent).copied().unwrap_or(0) + 1;
-            after_transforms = format!(
-                "{}{after_transforms}",
-                transforms::format_counter(&template, counter_value)
-            );
-        }
+        let counter_value = dir_indices.get(&parent).copied().unwrap_or(0) + 1;
+        let dir_count = dir_counts.get(&parent).copied().unwrap_or(0);
+        let ctx = transforms::CounterContext {
+            n: counter_value,
+            dir_count,
+        };
+        let after_transforms = transforms::apply(&after_expr, transforms_opts, ctx);
 
         let new_basename = format!("{prefix}{after_transforms}{suffix}");
 
@@ -242,7 +243,7 @@ pub(crate) fn build_plan(
             new,
             depth,
         });
-        if counter_template.is_some() {
+        if uses_counter {
             *dir_indices.entry(parent).or_default() += 1;
         }
     }
@@ -514,7 +515,6 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert_eq!(plan.len(), 1);
         validate_plan(&plan).unwrap();
@@ -745,7 +745,6 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert!(plan.is_empty());
 
@@ -770,7 +769,6 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
-            None,
         );
 
         assert_eq!(plan.len(), 1);
@@ -781,7 +779,7 @@ mod tests {
     // ---- counter ----------------------------------------------------------
 
     #[test]
-    fn build_plan_counter_resets_per_parent_directory() {
+    fn build_plan_counter_in_prepend_resets_per_parent_directory() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("sub");
         let records = vec![
@@ -791,13 +789,11 @@ mod tests {
             record(sub.join("d.txt"), tmp.path().to_path_buf()),
         ];
 
-        let plan = build_plan(
-            &records,
-            &[],
-            ExtensionScope::Include,
-            &transforms::TransformOptions::default(),
-            Some("{n:02}_"),
-        );
+        let opts = transforms::TransformOptions {
+            prepend: Some("{n:02}_".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
 
         assert_eq!(plan[0].new, tmp.path().join("01_a.txt"));
         assert_eq!(plan[1].new, tmp.path().join("02_b.txt"));
@@ -806,7 +802,27 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_smart_counter_uses_directory_entry_count_for_width() {
+    fn build_plan_counter_in_append_resets_per_parent_directory() {
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("a.txt"), tmp.path().to_path_buf()),
+            record(tmp.path().join("b.txt"), tmp.path().to_path_buf()),
+        ];
+
+        // Append runs on the stem (Exclude default reattaches `.txt`), so
+        // `-{n}` lands between stem and extension.
+        let opts = transforms::TransformOptions {
+            append: Some("-{n}".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+
+        assert_eq!(plan[0].new, tmp.path().join("a-1.txt"));
+        assert_eq!(plan[1].new, tmp.path().join("b-2.txt"));
+    }
+
+    #[test]
+    fn build_plan_smart_marker_uses_directory_entry_count_for_width() {
         let tmp = TempDir::new().unwrap();
         let records: Vec<_> = (0..100)
             .map(|i| {
@@ -817,13 +833,11 @@ mod tests {
             })
             .collect();
 
-        let plan = build_plan(
-            &records,
-            &[],
-            ExtensionScope::Include,
-            &transforms::TransformOptions::default(),
-            Some(transforms::SMART_COUNTER_TEMPLATE),
-        );
+        let opts = transforms::TransformOptions {
+            prepend: Some("{N}_".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
 
         assert_eq!(plan[0].new, tmp.path().join("001_file-0.txt"));
         assert_eq!(plan[98].new, tmp.path().join("099_file-98.txt"));
@@ -831,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_smart_counter_width_is_per_parent_directory() {
+    fn build_plan_smart_marker_width_is_per_parent_directory() {
         let tmp = TempDir::new().unwrap();
         let large = tmp.path().join("large");
         let small = tmp.path().join("small");
@@ -843,17 +857,34 @@ mod tests {
             )
         }));
 
-        let plan = build_plan(
-            &records,
-            &[],
-            ExtensionScope::Include,
-            &transforms::TransformOptions::default(),
-            Some(transforms::SMART_COUNTER_TEMPLATE),
-        );
+        let opts = transforms::TransformOptions {
+            prepend: Some("{N}_".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
 
         assert_eq!(plan[0].new, small.join("01_only.txt"));
         assert_eq!(plan[1].new, large.join("001_file-0.txt"));
         assert_eq!(plan[100].new, large.join("100_file-99.txt"));
+    }
+
+    #[test]
+    fn build_plan_prepend_and_append_share_per_parent_counter() {
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("a.txt"), tmp.path().to_path_buf()),
+            record(tmp.path().join("b.txt"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions {
+            prepend: Some("{n}-".into()),
+            append: Some("-{n}".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+
+        assert_eq!(plan[0].new, tmp.path().join("1-a-1.txt"));
+        assert_eq!(plan[1].new, tmp.path().join("2-b-2.txt"));
     }
 
     // ---- ExtensionScope::Exclude stem-only matching -----------------------
@@ -911,7 +942,6 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, txt_named);
@@ -923,7 +953,6 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert_eq!(plan_full.len(), 2);
     }
@@ -955,7 +984,6 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, archive);
@@ -977,7 +1005,6 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
-            None,
         );
 
         assert_eq!(plan.len(), 1);
@@ -1007,7 +1034,6 @@ mod tests {
             &exprs,
             ExtensionScope::Only,
             &transforms::TransformOptions::default(),
-            None,
         );
 
         assert_eq!(plan.len(), 2);
@@ -1035,7 +1061,6 @@ mod tests {
             &exprs,
             ExtensionScope::Only,
             &transforms::TransformOptions::default(),
-            None,
         );
         assert!(plan.is_empty());
     }

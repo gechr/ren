@@ -96,29 +96,19 @@ struct Cli {
     #[arg(short = 'U', long = "upper")]
     upper: bool,
 
-    /// Prepend literal string to each name
-    #[arg(short = 'A', long = "prepend", value_name = "STR")]
+    /// Prepend a literal string or template to each name
+    ///
+    /// Templates: `{n}` substitutes a 1-based per-parent-directory counter;
+    /// `{n:0WIDTH}` zero-pads to `WIDTH` digits; `{N}` zero-pads to a smart
+    /// per-parent width. `--prepend` and `--append` share the same counter.
+    #[arg(short = 'P', long = "prepend", value_name = "FMT")]
     prepend: Option<String>,
 
-    /// Append literal string to each name
-    #[arg(short = 'a', long = "append", value_name = "STR")]
-    append: Option<String>,
-
-    /// Prepend a sequential counter
+    /// Append a literal string or template to each name
     ///
-    /// Use `--counter` alone for the smart default format, or
-    /// `--counter=FORMAT` to customize. `{n}` substitutes the index;
-    /// `{n:0WIDTH}` zero-pads to WIDTH digits. For example,
-    /// `--counter='{n:03}_'` prefixes `001_`, `002_`, ....
-    #[arg(
-        short = 'c',
-        long = "counter",
-        value_name = "FORMAT",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = transforms::SMART_COUNTER_TEMPLATE,
-    )]
-    counter: Option<String>,
+    /// See `--prepend` for the templating DSL.
+    #[arg(short = 'A', long = "append", value_name = "FMT")]
+    append: Option<String>,
 
     /// Find replace expression
     #[arg(short = 'e', long = "expression", value_name = "<find> <replace>")]
@@ -210,9 +200,8 @@ fn print_help() {
 
   {red}-L{reset}, {red}--lower{reset}               Lowercase names
   {red}-U{reset}, {red}--upper{reset}               Uppercase names
-  {red}-A{reset}, {red}--prepend {dim}<str>{reset}       Prepend literal string
-  {red}-a{reset}, {red}--append {dim}<str>{reset}        Append literal string
-  {red}-c{reset}, {red}--counter {dim}[<fmt>]{reset}     Prepend counter
+  {red}-P{reset}, {red}--prepend {dim}<fmt>{reset}       Prepend a string or template
+  {red}-A{reset}, {red}--append {dim}<fmt>{reset}        Append a string or template
 
 {yellow}{bold}Behavior{reset}
 
@@ -301,17 +290,20 @@ fn print_help_long() {
   {grey}# Move into new subdirectories, creating parents as needed{reset}
   {green}${reset} ren --create-dirs --regex '^(.*)\\.log$' 'logs/$1.log'
 
-  {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart default){reset}
-  {green}${reset} ren --counter
+  {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart per-dir width){reset}
+  {green}${reset} ren --prepend '{{N}}_'
 
-  {grey}# Custom counter format with zero-padding{reset}
-  {green}${reset} ren --counter='{{n:03}}_'
+  {grey}# Custom counter format with explicit zero-padding{reset}
+  {green}${reset} ren --prepend='{{n:03}}_'
+
+  {grey}# Counter as a suffix on the stem (foo.txt → foo-1.txt, ...){reset}
+  {green}${reset} ren --append '-{{n}}'
 
   {grey}# Lowercase every name in cwd{reset}
   {green}${reset} ren --lower
 
-  {grey}# Compose: find/replace → lower → counter (in fixed order){reset}
-  {green}${reset} ren --counter --lower foo bar
+  {grey}# Compose: find/replace → lower → append → prepend (fixed order){reset}
+  {green}${reset} ren --prepend '{{N}}_' --lower foo bar
 "
     );
     print!("{text}");
@@ -356,16 +348,11 @@ impl Cli {
         self.lower |= bool_var("REN_LOWER");
         self.upper |= bool_var("REN_UPPER");
         // For `Option<String>` env vars, only fill when the CLI flag is absent.
-        // Counter env value is the literal template string - there's no
-        // shorthand "1 means default" because the value IS the config.
         if self.append.is_none() {
             self.append = str_var("REN_APPEND");
         }
         if self.prepend.is_none() {
             self.prepend = str_var("REN_PREPEND");
-        }
-        if self.counter.is_none() {
-            self.counter = str_var("REN_COUNTER");
         }
     }
 
@@ -391,15 +378,11 @@ impl Cli {
     }
 
     /// True when any transform flag (`--lower`, `--upper`, `--prepend`,
-    /// `--append`, `--counter`) is set. When true AND no `<find> <replace>`
-    /// positionals are provided, `<find> <replace>` is no longer required;
-    /// positionals become paths instead.
+    /// `--append`) is set. When true AND no `<find> <replace>` positionals
+    /// are provided, `<find> <replace>` is no longer required; positionals
+    /// become paths instead.
     fn uses_transforms(&self) -> bool {
-        self.lower
-            || self.upper
-            || self.append.is_some()
-            || self.prepend.is_some()
-            || self.counter.is_some()
+        self.lower || self.upper || self.append.is_some() || self.prepend.is_some()
     }
 
     fn positional_skip(&self) -> usize {
@@ -823,9 +806,6 @@ fn run() -> Result<()> {
         append: cli.append.clone(),
         prepend: cli.prepend.clone(),
     };
-    if let Some(ref t) = cli.counter {
-        transforms::validate_counter_template(t)?;
-    }
 
     let records = if from_stdin {
         io::records_from_paths(io::read_paths_from_stdin(cli.null)?)
@@ -862,13 +842,7 @@ fn run() -> Result<()> {
     } else {
         ExtensionScope::Exclude
     };
-    let plan = build_plan(
-        &records,
-        &exprs,
-        scope,
-        &transforms_opts,
-        cli.counter.as_deref(),
-    );
+    let plan = build_plan(&records, &exprs, scope, &transforms_opts);
     validate_plan(&plan)?;
 
     if plan.is_empty() {
@@ -1091,12 +1065,13 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_without_value_uses_smart_default() {
-        let cli = Cli::parse_from(["ren", "-c"]);
-        assert_eq!(
-            cli.counter.as_deref(),
-            Some(transforms::SMART_COUNTER_TEMPLATE)
-        );
+    fn test_prepend_and_append_short_flags_parse() {
+        // The append value here intentionally starts with `-` to lock in
+        // that the `=`-attached form is the way to pass dashed templates;
+        // the bare `-A -{n}` form trips clap's flag-vs-value heuristic.
+        let cli = Cli::parse_from(["ren", "-P", "{N}_", "-A=-{n}"]);
+        assert_eq!(cli.prepend.as_deref(), Some("{N}_"));
+        assert_eq!(cli.append.as_deref(), Some("-{n}"));
     }
 
     #[test]

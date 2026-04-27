@@ -69,32 +69,40 @@ ren -l foo
 # Case-only rename (works on case-insensitive filesystems too)
 ren tmp TMP
 
-# Number every file in cwd: 01_alpha.txt, 02_beta.txt, ... (smart default)
-ren --counter
+# Number every file in cwd: 01_alpha.txt, 02_beta.txt, ... (smart per-dir width)
+ren --prepend '{N}_'
 
-# Custom counter format with zero-padding and a path scope
-ren --counter='{n:03}_' src/
+# Custom counter format with explicit zero-padding and a path scope
+ren --prepend='{n:03}_' src/
+
+# Number files as a suffix on the stem: foo.txt -> foo-1.txt, ...
+ren --append '-{n}'
 
 # Lowercase every basename in cwd
 ren --lower
 
-# Compose: find/replace, then lowercase, then counter
-ren --counter --lower foo bar
+# Compose: find/replace, then lowercase, then append, then prepend
+ren --prepend '{N}_' --lower foo bar
 ```
 
 ## Transforms
 
-When `<find> <replace>` alone isn't enough, transforms layer over the find/replace stage. They're optional, compose with each other, and make `<find> <replace>` itself optional too - so `ren --counter` is a valid invocation.
+When `<find> <replace>` alone isn't enough, transforms layer over the find/replace stage. They're optional, compose with each other, and make `<find> <replace>` itself optional too - so `ren --prepend '{N}_'` is a valid invocation.
 
-| Flag                      | Effect                                         |
-| ------------------------- | ---------------------------------------------- |
-| `-L`, `--lower`           | lowercase the basename (mutex with `--upper`)  |
-| `-U`, `--upper`           | uppercase the basename                         |
-| `-A`, `--prepend <str>`   | prepend a literal string                       |
-| `-a`, `--append <str>`    | append a literal string                        |
-| `-c`, `--counter[=<fmt>]` | prepend a sequential counter                   |
+| Flag                    | Effect                                        |
+| ----------------------- | --------------------------------------------- |
+| `-L`, `--lower`         | lowercase the basename (mutex with `--upper`) |
+| `-U`, `--upper`         | uppercase the basename                        |
+| `-P`, `--prepend <fmt>` | prepend a literal string or template          |
+| `-A`, `--append <fmt>`  | append a literal string or template           |
 
-Counter format: `{n}` substitutes the 1-based index; `{n:0WIDTH}` zero-pads to `WIDTH` digits. Anything else passes through, so `[{n:02}]-`, `chapter-{n:03}_` etc. work as you'd expect. Use `--counter` alone for a smart per-directory default: `01_` below 100 entries, `001_` at 100+, `0001_` at 1000+, and so on. Use `--counter=FORMAT` to customize.
+Counter templates (recognised inside both `--prepend` and `--append`):
+
+- `{n}` - the 1-based per-parent-directory index (`1`, `2`, `3`, …).
+- `{n:0WIDTH}` - zero-padded to `WIDTH` digits (`{n:03}` → `001`, `002`, …).
+- `{N}` - smart-width: zero-padded to `max(2, len(dir_count))`. So a directory with under 100 entries gets `01`, `02`, …; 100+ gets `001`, `002`, …; 1000+ gets `0001`, `0002`, …. Pick this when you don't want to count by hand.
+
+Anything else in the format string passes through, so `[{n:02}]-`, `chapter-{n:03}_`, `-{n}` all work as written. Both affixes share the same per-record counter, so `--prepend '{n}-' --append '-{n}'` produces `1-foo-1`, `2-bar-2`, …. Values that start with `-` need the `=`-attached form (e.g. `--append='-{n}'`) so they aren't mistaken for flags.
 
 The pipeline runs in fixed canonical order regardless of argv order:
 
@@ -102,9 +110,8 @@ The pipeline runs in fixed canonical order regardless of argv order:
 2. `--lower` *or* `--upper`
 3. `--append`
 4. `--prepend`
-5. `--counter`
 
-By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `01_` for the smart default. Files filtered out by find/replace don't consume a counter slot.
+By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `1` (or `01`, `001`, … with a width specifier). Files filtered out by find/replace don't consume a counter slot.
 
 ## Preview keymap
 
