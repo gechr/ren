@@ -174,7 +174,9 @@ fn duplicate_target_is_a_validation_error() {
     fs::write(dir.path().join("b.txt"), "").unwrap();
 
     ren(&dir)
-        .args(["--regex", r"^[ab]\.txt$", "c.txt"])
+        // `-x` so the regex anchors match the full basename, including the
+        // `.txt` extension; the default Exclude scope would only see stems.
+        .args(["-x", "--regex", r"^[ab]\.txt$", "c.txt"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("within-plan conflicts"));
@@ -223,20 +225,21 @@ fn long_help_short_circuits_with_examples() {
 }
 
 #[test]
-fn no_extension_protects_extension_from_rewrite() {
-    // `-E` matches against the file stem only. With pattern `txt → notes`:
+fn default_scope_protects_extension_from_rewrite() {
+    // The default scope matches against the file stem only. With pattern
+    // `txt → notes`:
     //
     //   - `report.txt`: stem `report` doesn't contain `txt`, ext `txt` is
-    //     ignored under `-E` → unchanged.
+    //     ignored by default → unchanged.
     //   - `notes.md`: stem `notes` doesn't contain `txt` → unchanged.
     //
-    // Without `-E`, `report.txt` would be rewritten to `report.notes`, which
-    // is the accident `-E` is designed to prevent.
+    // With `-x`, `report.txt` would be rewritten to `report.notes`, which is
+    // the accident the stem-only default is designed to prevent.
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("report.txt"), "").unwrap();
     fs::write(dir.path().join("notes.md"), "").unwrap();
 
-    ren(&dir).args(["-E", "txt", "notes"]).assert().success();
+    ren(&dir).args(["txt", "notes"]).assert().success();
 
     // Both files untouched: stem-only matching means `txt` in the extension
     // doesn't trigger a rename, and `notes.md` doesn't match anywhere.
@@ -246,19 +249,47 @@ fn no_extension_protects_extension_from_rewrite() {
 }
 
 #[test]
-fn no_extension_renames_stem_and_reattaches_extension() {
-    // Positive case: `-E` rewrites the stem and reattaches the original ext
-    // unchanged. `foo.rs` becomes `bar.rs`.
+fn default_scope_renames_stem_and_reattaches_extension() {
+    // Positive case: the default rewrites the stem and reattaches the
+    // original ext unchanged. `foo.rs` becomes `bar.rs`.
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("foo.rs"), "").unwrap();
     fs::write(dir.path().join("foo.tar.gz"), "").unwrap();
 
-    ren(&dir).args(["-E", "foo", "bar"]).assert().success();
+    ren(&dir).args(["foo", "bar"]).assert().success();
 
     assert!(dir.path().join("bar.rs").exists());
     assert!(dir.path().join("bar.tar.gz").exists());
     assert!(!dir.path().join("foo.rs").exists());
     assert!(!dir.path().join("foo.tar.gz").exists());
+}
+
+#[test]
+fn include_extension_flag_matches_full_basename() {
+    // `-x` opts into matching the full basename, including the extension.
+    // `report.txt` becomes `report.notes` because the ext matches `txt`.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("report.txt"), "").unwrap();
+
+    ren(&dir).args(["-x", "txt", "notes"]).assert().success();
+
+    assert!(dir.path().join("report.notes").exists());
+    assert!(!dir.path().join("report.txt").exists());
+}
+
+#[test]
+fn only_extension_flag_matches_extension_and_preserves_stem() {
+    // `-X` runs the pipeline on the extension only. `foo.rs` becomes
+    // `foo.txt`; files without an extension (`Makefile`) are skipped.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.rs"), "").unwrap();
+    fs::write(dir.path().join("Makefile"), "").unwrap();
+
+    ren(&dir).args(["-X", "rs", "txt"]).assert().success();
+
+    assert!(dir.path().join("foo.txt").exists());
+    assert!(!dir.path().join("foo.rs").exists());
+    assert!(dir.path().join("Makefile").exists());
 }
 
 #[test]

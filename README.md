@@ -35,8 +35,14 @@ ren --include-dirs foo bar
 # Restrict to .rs files
 ren -f rs old new
 
-# Match the stem only; leave extensions alone (api_v1.json -> api_v2.json)
-ren -E v1 v2
+# Stem-only matching is the default (api_v1.json -> api_v2.json)
+ren v1 v2
+
+# Include extensions in matching and replacement
+ren -x rs txt
+
+# Match only the extension; preserve the stem (foo.rs -> foo.txt)
+ren -X rs txt
 
 # Smart-rename across case variants
 #   foo_bar -> hello_world, FooBar -> HelloWorld, FOO_BAR -> HELLO_WORLD, ...
@@ -98,7 +104,7 @@ The pipeline runs in fixed canonical order regardless of argv order:
 4. `--prepend`
 5. `--counter`
 
-`-E/--no-extension` scopes the entire pipeline to the stem; the extension is reattached afterward. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `01_` for the smart default. Files filtered out by find/replace don't consume a counter slot.
+By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `01_` for the smart default. Files filtered out by find/replace don't consume a counter slot.
 
 ## Preview keymap
 

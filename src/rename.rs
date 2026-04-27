@@ -44,12 +44,31 @@ pub(crate) struct PlanEntry {
     pub depth: usize,
 }
 
-/// Common compound extensions recognised by `--no-extension`. Best-effort
-/// list - uncommon multi-dot patterns (`.tar.lzma`, `.spec.ts`, `.d.ts`, etc.)
-/// fall through to single-extension semantics. ASCII case-insensitive match.
+/// Common compound extensions recognised by stem/extension splitting.
+/// Best-effort list - uncommon multi-dot patterns (`.tar.lzma`, `.spec.ts`,
+/// `.d.ts`, etc.) fall through to single-extension semantics. ASCII
+/// case-insensitive match.
 const COMPOUND_EXTENSIONS: &[&str] = &["tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz"];
 
-/// Split a basename into `(stem, ext)` for `--no-extension` matching, where
+/// Which part of each basename the rename pipeline operates on.
+///
+/// `Exclude` is the default: the pipeline runs on the stem only, and
+/// `build_plan` reattaches the original extension unchanged. This prevents
+/// accidents like `ren txt notes` rewriting `report.txt` to `report.notes`.
+///
+/// `Include` (`-x`) opts back into running the pipeline on the full basename.
+///
+/// `Only` (`-X`) flips the split: the pipeline runs on the extension only and
+/// the stem is preserved. Files without an extension are skipped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExtensionScope {
+    #[default]
+    Exclude,
+    Include,
+    Only,
+}
+
+/// Split a basename into `(stem, ext)` for stem/extension matching, where
 /// `ext` is `Some("rs")` for `foo.rs`, `Some("tar.gz")` for `archive.tar.gz`
 /// (compound-extension best effort), `Some("")` for `archive.` (empty after
 /// the trailing dot - preserved on round-trip), and `None` for `Makefile`,
@@ -109,10 +128,10 @@ fn split_stem_ext(basename: &str) -> (&str, Option<&str>) {
 /// naturally; `build_plan` does not re-sort. This deterministic ordering is a
 /// load-bearing invariant for `apply_plan`'s per-depth grouping.
 ///
-/// When `no_extension` is true the find/replace stage AND the transform
-/// pipeline both operate on the file *stem* only; the extension is reattached
-/// unchanged afterward. Files with no extension (`Makefile`, `.bashrc`) are
-/// processed as-is - there's nothing to strip.
+/// `scope` selects which part of the basename the pipeline operates on:
+/// `Exclude` (default) runs on the stem only and reattaches the extension;
+/// `Include` runs on the full basename; `Only` runs on the extension and
+/// preserves the stem. See `ExtensionScope` for the precise semantics.
 ///
 /// The transform pipeline runs after find/replace in fixed canonical order
 /// (see `transforms::apply`). When `counter_template` is set, the counter
@@ -121,7 +140,7 @@ fn split_stem_ext(basename: &str) -> (&str, Option<&str>) {
 pub(crate) fn build_plan(
     records: &[scan::PathRecord],
     exprs: &[expressions::CompiledExpression],
-    no_extension: bool,
+    scope: ExtensionScope,
     transforms_opts: &transforms::TransformOptions,
     counter_template: Option<&str>,
 ) -> Vec<PlanEntry> {
@@ -147,14 +166,41 @@ pub(crate) fn build_plan(
         };
         let parent = parent_key(&record.path);
 
-        // With `--no-extension`, the entire pipeline (find/replace + transforms)
-        // runs on the stem only; the extension is reattached at the end.
-        let (working_input, ext) = if no_extension {
-            let (stem, ext) = split_stem_ext(basename);
-            (stem, ext)
-        } else {
-            (basename, None)
-        };
+        // The pipeline (find/replace + transforms) runs on `working_input`,
+        // and the result is reassembled as `prefix + after_transforms + suffix`.
+        //
+        //   Exclude (default): pipeline on stem; reattach `.ext`
+        //   Include (`-x`):    pipeline on full basename
+        //   Only    (`-X`):    pipeline on ext; reattach `stem.` prefix
+        let prefix: String;
+        let suffix: String;
+        let working_input: &str;
+        match scope {
+            ExtensionScope::Include => {
+                prefix = String::new();
+                suffix = String::new();
+                working_input = basename;
+            }
+            ExtensionScope::Exclude => {
+                let (stem, ext) = split_stem_ext(basename);
+                prefix = String::new();
+                suffix = match ext {
+                    Some(e) => format!(".{e}"),
+                    None => String::new(),
+                };
+                working_input = stem;
+            }
+            ExtensionScope::Only => {
+                let (stem, ext) = split_stem_ext(basename);
+                let Some(e) = ext else {
+                    // No extension to operate on; skip.
+                    continue;
+                };
+                prefix = format!("{stem}.");
+                suffix = String::new();
+                working_input = e;
+            }
+        }
 
         let (after_expr, _) = expressions::apply_to_basename(working_input, exprs);
         let mut after_transforms = transforms::apply(&after_expr, transforms_opts);
@@ -173,14 +219,7 @@ pub(crate) fn build_plan(
             );
         }
 
-        let new_basename = if no_extension {
-            match ext {
-                Some(e) => format!("{after_transforms}.{e}"),
-                None => after_transforms,
-            }
-        } else {
-            after_transforms
-        };
+        let new_basename = format!("{prefix}{after_transforms}{suffix}");
 
         if new_basename == basename {
             continue;
@@ -428,6 +467,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::ExtensionScope;
     use super::PlanEntry;
     use super::apply_depth_group;
     use super::apply_plan;
@@ -472,7 +512,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &exprs,
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -703,7 +743,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &exprs,
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -728,7 +768,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &exprs,
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -754,7 +794,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &[],
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             Some("{n:02}_"),
         );
@@ -780,7 +820,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &[],
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             Some(transforms::SMART_COUNTER_TEMPLATE),
         );
@@ -806,7 +846,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &[],
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             Some(transforms::SMART_COUNTER_TEMPLATE),
         );
@@ -816,7 +856,7 @@ mod tests {
         assert_eq!(plan[100].new, large.join("100_file-99.txt"));
     }
 
-    // ---- --no-extension stem-only matching --------------------------------
+    // ---- ExtensionScope::Exclude stem-only matching -----------------------
 
     #[test]
     fn split_stem_ext_handles_edge_cases() {
@@ -848,10 +888,10 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_no_extension_matches_stem_only() {
-        // Concrete proof: with `-E`, a literal pattern that only appears in
-        // an extension does not match. Without `-E`, the same pattern would
-        // rewrite the basename.
+    fn build_plan_exclude_scope_matches_stem_only() {
+        // Concrete proof: with the default `Exclude` scope, a literal pattern
+        // that only appears in an extension does not match. With `Include`
+        // (`-x`), the same pattern would rewrite the basename.
         let tmp = TempDir::new().unwrap();
         let report = tmp.path().join("report.txt");
         let txt_named = tmp.path().join("txt_notes.md");
@@ -864,12 +904,12 @@ mod tests {
             record(txt_named.clone(), tmp.path().to_path_buf()),
         ];
 
-        // With `-E`: only `txt_notes.md` matches (stem contains `txt`);
+        // With Exclude: only `txt_notes.md` matches (stem contains `txt`);
         // `report.txt` is unchanged because `txt` only appears in the ext.
         let plan = build_plan(
             &records,
             &exprs,
-            true,
+            ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -877,11 +917,11 @@ mod tests {
         assert_eq!(plan[0].old, txt_named);
         assert_eq!(plan[0].new, tmp.path().join("notes_notes.md"));
 
-        // Without `-E`: both match.
+        // With Include: both match.
         let plan_full = build_plan(
             &records,
             &exprs,
-            false,
+            ExtensionScope::Include,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -889,10 +929,10 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_no_extension_handles_dotfiles_and_extensionless() {
-        // `.bashrc` and `Makefile` have no extension; `-E` should still match
-        // the stem, which IS the whole basename. `archive.tar.gz` should only
-        // strip `.gz` (not `.tar.gz`).
+    fn build_plan_exclude_scope_handles_dotfiles_and_extensionless() {
+        // `.bashrc` and `Makefile` have no extension; the Exclude scope should
+        // still match the stem, which IS the whole basename. `archive.tar.gz`
+        // is split as a compound extension.
         let tmp = TempDir::new().unwrap();
         let bashrc = tmp.path().join(".bashrc");
         let makefile = tmp.path().join("Makefile");
@@ -913,7 +953,7 @@ mod tests {
         let plan = build_plan(
             &records,
             &exprs,
-            true,
+            ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -923,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_no_extension_preserves_trailing_dot() {
+    fn build_plan_exclude_scope_preserves_trailing_dot() {
         // `archive.` has stem `archive` and an empty-string extension. After
         // a stem-only rename, the trailing dot must round-trip.
         let tmp = TempDir::new().unwrap();
@@ -935,13 +975,69 @@ mod tests {
         let plan = build_plan(
             &records,
             &exprs,
-            true,
+            ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
             None,
         );
 
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].new, tmp.path().join("release."));
+    }
+
+    // ---- ExtensionScope::Only extension-only matching ---------------------
+
+    #[test]
+    fn build_plan_only_scope_matches_extension_and_preserves_stem() {
+        // With `Only`, the pipeline runs on the extension only. `foo.rs`
+        // becomes `foo.txt` under `rs → txt`; `foo.txt` is unchanged because
+        // its ext is already `txt`; the stem is preserved verbatim.
+        let tmp = TempDir::new().unwrap();
+        let foo_rs = tmp.path().join("foo.rs");
+        let bar_rs = tmp.path().join("bar.rs");
+        fs::write(&foo_rs, "").unwrap();
+        fs::write(&bar_rs, "").unwrap();
+
+        let exprs = compile("rs", "txt");
+        let records = vec![
+            record(foo_rs.clone(), tmp.path().to_path_buf()),
+            record(bar_rs.clone(), tmp.path().to_path_buf()),
+        ];
+        let plan = build_plan(
+            &records,
+            &exprs,
+            ExtensionScope::Only,
+            &transforms::TransformOptions::default(),
+            None,
+        );
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].new, tmp.path().join("foo.txt"));
+        assert_eq!(plan[1].new, tmp.path().join("bar.txt"));
+    }
+
+    #[test]
+    fn build_plan_only_scope_skips_files_without_extension() {
+        // Files with no extension (`Makefile`, `.bashrc`) have nothing for the
+        // pipeline to operate on under `Only`; they're skipped entirely.
+        let tmp = TempDir::new().unwrap();
+        let makefile = tmp.path().join("Makefile");
+        let bashrc = tmp.path().join(".bashrc");
+        fs::write(&makefile, "").unwrap();
+        fs::write(&bashrc, "").unwrap();
+
+        let exprs = compile("a", "z");
+        let records = vec![
+            record(makefile.clone(), tmp.path().to_path_buf()),
+            record(bashrc.clone(), tmp.path().to_path_buf()),
+        ];
+        let plan = build_plan(
+            &records,
+            &exprs,
+            ExtensionScope::Only,
+            &transforms::TransformOptions::default(),
+            None,
+        );
+        assert!(plan.is_empty());
     }
 
     // ---- phase-2 rollback (via injected fake rename) ---------------------

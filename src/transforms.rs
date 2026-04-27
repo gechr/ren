@@ -5,8 +5,9 @@
 //   find/replace  →  lower XOR upper  →  append  →  prepend
 //
 // `--lower` and `--upper` are mutually exclusive (clap-level conflict).
-// When `-E/--no-extension` is set, the entire pipeline runs on the stem only;
-// `build_plan` reattaches the extension afterward.
+// The pipeline runs on the file stem by default; `-x/--include-extension`
+// runs it on the full basename, and `-X/--only-extension` runs it on the
+// extension only. `build_plan` handles the split/reattach.
 
 use std::sync::LazyLock;
 

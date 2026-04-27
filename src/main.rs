@@ -12,7 +12,7 @@ use clap::{CommandFactory as _, Parser};
 use clap_complete::Shell;
 
 use crate::expressions::{CompileOptions, EXPR_SEP, compile_expressions};
-use crate::rename::{PlanEntry, apply_plan, build_plan, validate_plan};
+use crate::rename::{ExtensionScope, PlanEntry, apply_plan, build_plan, validate_plan};
 
 #[derive(Parser)]
 #[command(name = "ren", version, disable_help_flag = true)]
@@ -43,16 +43,28 @@ struct Cli {
     recursive: bool,
 
     /// Admit directories into the rename plan
-    #[arg(long = "include-dirs")]
+    #[arg(short = 'd', long = "include-dirs")]
     include_dirs: bool,
 
-    /// Exclude file extension from rename
+    /// Include file extension in matching and replacement
     ///
-    /// Match against the file stem only; the extension (per
-    /// `Path::extension`) is reattached unchanged. Prevents accidents like
-    /// `ren txt notes` rewriting `report.txt` to `report.notes`.
-    #[arg(short = 'E', long = "no-extension")]
-    no_extension: bool,
+    /// By default the pipeline runs on the file stem only and the extension
+    /// (per `Path::extension`) is reattached unchanged - this prevents
+    /// accidents like `ren txt notes` rewriting `report.txt` to
+    /// `report.notes`. `-x` opts back into matching the full basename.
+    #[arg(
+        short = 'x',
+        long = "include-extension",
+        conflicts_with = "only_extension"
+    )]
+    include_extension: bool,
+
+    /// Match the file extension only
+    ///
+    /// The pipeline runs on the extension only; the stem is preserved
+    /// verbatim. Files without an extension are skipped.
+    #[arg(short = 'X', long = "only-extension")]
+    only_extension: bool,
 
     /// Greedy matching
     #[arg(short = 'G', long = "greedy")]
@@ -82,7 +94,7 @@ struct Cli {
     #[arg(short = 'A', long = "prepend", value_name = "STR")]
     prepend: Option<String>,
 
-    /// Append literal string to each name (or stem with -E)
+    /// Append literal string to each name
     #[arg(short = 'a', long = "append", value_name = "STR")]
     append: Option<String>,
 
@@ -179,8 +191,9 @@ fn print_help() {
 {yellow}{bold}Scope{reset}
 
   {red}-R{reset}, {red}--recursive{reset}           Recurse into subdirectories
-      {red}--include-dirs{reset}        Also rename directories
-  {red}-E{reset}, {red}--no-extension{reset}        Exclude file extension from rename
+  {red}-d{reset}, {red}--include-dirs{reset}        Also rename directories
+  {red}-x{reset}, {red}--include-extension{reset}   Include extension in matching and replacement
+  {red}-X{reset}, {red}--only-extension{reset}      Match the file extension only
 
 {yellow}{bold}Transforms{reset}
 
@@ -241,8 +254,14 @@ fn print_help_long() {
   {grey}# Restrict to .rs files{reset}
   {green}${reset} ren -f rs old new
 
-  {grey}# Match the stem only; leave extensions alone (api_v1.json → api_v2.json){reset}
-  {green}${reset} ren -E v1 v2
+  {grey}# Stem-only matching is the default (api_v1.json → api_v2.json){reset}
+  {green}${reset} ren v1 v2
+
+  {grey}# Include extensions in matching and replacement{reset}
+  {green}${reset} ren -x rs txt
+
+  {grey}# Match only the extension; preserve the stem (foo.rs → foo.txt){reset}
+  {green}${reset} ren -X rs txt
 
   {grey}# Smart-rename across case variants:{reset}
   {grey}#  \"foo_bar\" → \"hello_world\", \"FooBar\" → \"HelloWorld\", etc.{reset}
@@ -299,7 +318,8 @@ impl Cli {
         self.no_ignore |= bool_var("REN_NO_IGNORE");
         self.recursive |= bool_var("REN_RECURSIVE");
         self.include_dirs |= bool_var("REN_INCLUDE_DIRS");
-        self.no_extension |= bool_var("REN_NO_EXTENSION");
+        self.include_extension |= bool_var("REN_INCLUDE_EXTENSION");
+        self.only_extension |= bool_var("REN_ONLY_EXTENSION");
         self.greedy |= bool_var("REN_GREEDY");
         self.ignore_case |= bool_var("REN_IGNORE_CASE");
         self.regexp |= bool_var("REN_REGEXP");
@@ -738,17 +758,23 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    let scope = if cli.only_extension {
+        ExtensionScope::Only
+    } else if cli.include_extension {
+        ExtensionScope::Include
+    } else {
+        ExtensionScope::Exclude
+    };
     let plan = build_plan(
         &records,
         &exprs,
-        cli.no_extension,
+        scope,
         &transforms_opts,
         cli.counter.as_deref(),
     );
     validate_plan(&plan)?;
 
     if plan.is_empty() {
-        println!("No matches.");
         return Ok(());
     }
 
@@ -986,7 +1012,8 @@ mod tests {
             ("REN_NO_IGNORE", "true"),
             ("REN_RECURSIVE", "1"),
             ("REN_INCLUDE_DIRS", "true"),
-            ("REN_NO_EXTENSION", "1"),
+            ("REN_INCLUDE_EXTENSION", "1"),
+            ("REN_ONLY_EXTENSION", "1"),
             ("REN_SMART", "TRUE"),
             ("REN_IGNORE_CASE", "1"),
             ("REN_GREEDY", "1"),
@@ -999,7 +1026,8 @@ mod tests {
         assert!(cli.no_ignore);
         assert!(cli.recursive);
         assert!(cli.include_dirs);
-        assert!(cli.no_extension);
+        assert!(cli.include_extension);
+        assert!(cli.only_extension);
         assert!(cli.smart);
         assert!(cli.ignore_case);
         assert!(cli.greedy);
