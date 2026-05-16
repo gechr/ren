@@ -915,25 +915,51 @@ fn print_summary(plan: &[PlanEntry], dry: bool) {
 
 /// Create any missing parent directories for the plan's `new` paths. Called
 /// just before `apply_plan` when `--create-dirs` is set.
+///
+/// If a parent path already exists but is not a directory (e.g. a regular file
+/// blocking the intended `mkdir -p`), this returns an actionable error before
+/// `apply_plan` runs. Without this check the failure would surface later as a
+/// confusing `ENOTDIR`/`ENOENT` from inside the two-phase rename - by which
+/// point phase 1 has already moved the source to a temp.
 fn create_missing_parents(plan: &[PlanEntry]) -> Result<()> {
     for entry in plan {
         let Some(parent) = entry.new.parent() else {
             continue;
         };
-        if parent.as_os_str().is_empty() || parent.exists() {
+        if parent.as_os_str().is_empty() {
             continue;
         }
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create parent directory: {}", parent.display()))?;
+        // `metadata` follows symlinks, so a symlink-to-dir counts as a dir
+        // (correct) and a symlink-to-file is reported as the non-dir it
+        // resolves to (also correct). A broken symlink or missing path falls
+        // through to `create_dir_all`, which produces its own error.
+        match std::fs::metadata(parent) {
+            Ok(m) if m.is_dir() => continue,
+            Ok(_) => {
+                bail!(
+                    "cannot create parent directory {}: a non-directory file already exists at that path (rename target: {})",
+                    parent.display(),
+                    entry.new.display(),
+                );
+            }
+            Err(_) => {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create parent directory: {}", parent.display()))?;
+            }
+        }
     }
     Ok(())
 }
 
 fn print_error(err: &anyhow::Error) {
+    // `{err:#}` walks the anyhow context chain, joining layers with `: ` so the
+    // underlying io::Error (or other source) reaches the user instead of being
+    // swallowed by the outermost context. Without this the user sees only the
+    // top frame, which is often just a generic "X failed" wrapper.
     if std::io::stderr().is_terminal() {
-        eprintln!("\x1b[1;31merror:\x1b[m {err}");
+        eprintln!("\x1b[1;31merror:\x1b[m {err:#}");
     } else {
-        eprintln!("error: {err}");
+        eprintln!("error: {err:#}");
     }
 }
 
@@ -1783,5 +1809,63 @@ mod tests {
                 .collect(),
         );
         assert_eq!(args, vec!["ren", "-e", &format!("foo{EXPR_SEP}bar")]);
+    }
+
+    // ---- create_missing_parents ------------------------------------------
+
+    #[test]
+    fn test_create_missing_parents_errors_when_parent_is_a_file() {
+        // Reproduces `ren a a/b` with create-dirs on, where `a` exists as a
+        // regular file. The plan asks us to mkdir -p `a/`, but `a` is blocked
+        // by the file. Previously this slipped past `parent.exists()` and the
+        // failure surfaced from inside the two-phase rename after phase 1 had
+        // already moved the source to a temp. Now we fail upfront with an
+        // actionable message naming the offending path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        std::fs::write(&a, "").unwrap();
+        let plan = vec![PlanEntry {
+            old: a.clone(),
+            new: a.join("b"),
+            depth: 1,
+        }];
+
+        let err = create_missing_parents(&plan).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "cannot create parent directory {}: a non-directory file already exists at that path (rename target: {})",
+                a.display(),
+                a.join("b").display(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_create_missing_parents_creates_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("nested/sub");
+        let plan = vec![PlanEntry {
+            old: tmp.path().join("src"),
+            new: parent.join("dst"),
+            depth: 1,
+        }];
+
+        create_missing_parents(&plan).unwrap();
+        assert!(parent.is_dir());
+    }
+
+    #[test]
+    fn test_create_missing_parents_skips_existing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("already");
+        std::fs::create_dir(&parent).unwrap();
+        let plan = vec![PlanEntry {
+            old: tmp.path().join("src"),
+            new: parent.join("dst"),
+            depth: 1,
+        }];
+
+        create_missing_parents(&plan).unwrap();
     }
 }

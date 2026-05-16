@@ -356,8 +356,8 @@ where
         by_depth.entry(entry.depth).or_default().push(entry);
     }
 
-    for (&depth, group) in by_depth.iter().rev() {
-        apply_depth_group(depth, group, &rename_op)?;
+    for (_, group) in by_depth.iter().rev() {
+        apply_depth_group(group, &rename_op)?;
     }
 
     Ok(())
@@ -365,7 +365,7 @@ where
 
 /// Apply a single depth-group: phase 1 (old → temp) then phase 2 (temp → new),
 /// with per-depth rollback on phase-2 failure.
-fn apply_depth_group<F>(depth: usize, group: &[&PlanEntry], rename_op: &F) -> Result<()>
+fn apply_depth_group<F>(group: &[&PlanEntry], rename_op: &F) -> Result<()>
 where
     F: Fn(&Path, &Path) -> io::Result<()>,
 {
@@ -386,10 +386,13 @@ where
                     temp = unique_temp_path(&entry.old);
                 }
                 Err(e) => {
+                    // User-facing: the rename of `old` to `new` failed. The
+                    // temp hop is an implementation detail; the user wrote a
+                    // find/replace, they see "rename A → B".
                     return Err(anyhow::Error::from(e).context(format!(
-                        "phase 1 rename failed at depth {depth}: {} -> {}",
+                        "could not rename {} → {}",
                         entry.old.display(),
-                        temp.display(),
+                        entry.new.display(),
                     )));
                 }
             }
@@ -406,28 +409,33 @@ where
             // Rollback: undo phase-2 successes in reverse, then phase-1 temps
             // in reverse. Failures during rollback are warned but never mask
             // the original phase-2 error.
+            //
+            // The two warning shapes differ because the file's stuck location
+            // does: a failed phase-2 undo leaves the file at `new` (already
+            // renamed), while a failed phase-1 undo leaves it at the internal
+            // temp path — which the user has to know about to recover it.
             for (done_entry, done_temp) in phase2_done.iter().rev() {
                 if let Err(re) = rename_op(&done_entry.new, done_temp) {
                     eprintln!(
-                        "warning: rollback failed: {} -> {}: {}",
+                        "warning: could not undo rename of {} → {}: {re}",
+                        done_entry.old.display(),
                         done_entry.new.display(),
-                        done_temp.display(),
-                        re,
                     );
                 }
             }
             for (a_entry, a_temp) in applied.iter().rev() {
                 if let Err(re) = rename_op(a_temp, &a_entry.old) {
                     eprintln!(
-                        "warning: rollback failed: {} -> {}: {}",
-                        a_temp.display(),
+                        "warning: {} could not be restored and is currently at {}: {re}",
                         a_entry.old.display(),
-                        re,
+                        a_temp.display(),
                     );
                 }
             }
             return Err(anyhow::Error::from(e).context(format!(
-                "apply_plan failed at depth {depth}; depths > {depth} have already been applied and were not rolled back"
+                "could not rename {} → {}",
+                entry.old.display(),
+                entry.new.display(),
             )));
         }
         phase2_done.push((entry, temp.clone()));
@@ -1102,13 +1110,20 @@ mod tests {
             let this = *n;
             drop(n);
             if this == 4 {
-                return Err(io::Error::other("synthetic phase-2 failure"));
+                return Err(io::Error::other("fake rename failure"));
             }
             fs::rename(from, to)
         };
 
-        let err = apply_depth_group(1, &group, &rename_op).unwrap_err();
-        assert!(format!("{err}").contains("apply_plan failed at depth 1"));
+        let err = apply_depth_group(&group, &rename_op).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "could not rename {} → {}: fake rename failure",
+                entry_b.old.display(),
+                entry_b.new.display(),
+            ),
+        );
 
         // After rollback, both originals should be back at their starting
         // paths with their starting contents, and neither `new` should exist.
