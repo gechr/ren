@@ -72,6 +72,7 @@ pub struct Config {
     pub prepend: Option<String>,
     pub append: Option<String>,
     pub dry_run: Option<bool>,
+    pub write: Option<bool>,
     pub preview: Option<bool>,
     pub create_dirs: Option<bool>,
 }
@@ -125,6 +126,7 @@ fn apply_to_env(cfg: &Config, origin: &mut Origin) {
     set_str(cfg.prepend.as_deref(), "REN_PREPEND", origin);
     set_str(cfg.append.as_deref(), "REN_APPEND", origin);
     set_bool(cfg.dry_run, "REN_DRY_RUN", origin);
+    set_bool(cfg.write, "REN_WRITE", origin);
     set_bool(cfg.preview, "REN_PREVIEW", origin);
     set_bool(cfg.create_dirs, "REN_CREATE_DIRS", origin);
 }

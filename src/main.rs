@@ -188,10 +188,11 @@ struct Cli {
     #[arg(short = 'l', long = "list-files")]
     list_files: bool,
 
-    /// Dry run
+    /// Dry run (default)
     ///
-    /// Composes with `--preview`: prompts the user to accept/reject each entry,
-    /// then prints the would-rename plan instead of applying it.
+    /// Print the planned renames without touching the filesystem. This is the
+    /// default mode - pass `--write` (or `-W`) to actually rename. The flag
+    /// remains for shell scripts / config that want to be explicit.
     #[arg(
         short = 'n',
         long = "dry-run",
@@ -200,6 +201,19 @@ struct Cli {
         value_parser = BoolishValueParser::new()
     )]
     dry_run: bool,
+
+    /// Apply renames to disk
+    ///
+    /// Opts into the actual rename. Without this flag, ren prints the plan and
+    /// exits. `-y` is a hidden short alias.
+    #[arg(
+        short = 'W',
+        short_alias = 'y',
+        long = "write",
+        env = "REN_WRITE",
+        value_parser = BoolishValueParser::new()
+    )]
+    write: bool,
 
     /// Interactive preview
     #[arg(
@@ -291,7 +305,8 @@ fn print_help() {
 
   {red}-l{reset}, {red}--list-files{reset}          Print matching file paths (no rename)
 
-  {red}-n{reset}, {red}--dry-run{reset}             Show what would be changed without renaming
+  {red}-n{reset}, {red}--dry-run{reset}             Show what would be changed without renaming {grey}(default){reset}
+  {red}-W{reset}, {red}--write{reset}               Apply renames to disk
   {red}-p{reset}, {red}--preview{reset}             Preview the changes before applying them
 
 {yellow}{bold}Miscellaneous{reset}
@@ -357,11 +372,11 @@ fn print_help_long() {
   {grey}# Regex rename: replace test_ prefix with spec_{reset}
   {green}${reset} ren --regex '^test_' 'spec_'
 
-  {grey}# Interactive preview before applying{reset}
-  {green}${reset} ren --preview foo bar
+  {grey}# Plan is shown by default; pass -W to actually rename{reset}
+  {green}${reset} ren -W foo bar
 
-  {grey}# Plan only, don't touch the filesystem{reset}
-  {green}${reset} ren --dry-run foo bar
+  {grey}# Interactive preview, applying only the accepted entries{reset}
+  {green}${reset} ren --preview foo bar
 
   {grey}# Apply multiple replacements in a single pass{reset}
   {green}${reset} ren -e foo bar -e baz qux
@@ -495,6 +510,19 @@ fn resolve_mutex_groups(
     matches: &ArgMatches,
     origin: &config::Origin,
 ) -> Result<()> {
+    // Mode group: exactly one of dry-run / write / preview / list-files wins.
+    // Same-tier collisions (two CLI flags, two env vars, etc.) become errors;
+    // cross-tier resolves by precedence so a CLI flag always beats env/config.
+    let mode = resolve_group(
+        matches,
+        origin,
+        &["dry_run", "write", "preview", "list_files"],
+    )?;
+    cli.dry_run = mode == Some("dry_run");
+    cli.write = mode == Some("write");
+    cli.preview = mode == Some("preview");
+    cli.list_files = mode == Some("list_files");
+
     let case = resolve_group(matches, origin, &["lower", "upper"])?;
     cli.lower = case == Some("lower");
     cli.upper = case == Some("upper");
@@ -636,6 +664,7 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
         "prepend" => "REN_PREPEND",
         "append" => "REN_APPEND",
         "dry_run" => "REN_DRY_RUN",
+        "write" => "REN_WRITE",
         "preview" => "REN_PREVIEW",
         "create_dirs" => "REN_CREATE_DIRS",
         _ => return None,
@@ -1091,19 +1120,15 @@ fn run() -> Result<()> {
         if accepted.is_empty() {
             return Ok(());
         }
-        if cli.dry_run {
-            print_summary(&accepted, true);
-        } else {
-            if cli.create_dirs {
-                create_missing_parents(&accepted)?;
-            }
-            apply_plan(&accepted)?;
-            print_summary(&accepted, false);
+        if cli.create_dirs {
+            create_missing_parents(&accepted)?;
         }
+        apply_plan(&accepted)?;
+        print_summary(&accepted, false);
         return Ok(());
     }
 
-    if cli.dry_run {
+    if !cli.write {
         print_summary(&plan, true);
         return Ok(());
     }
@@ -1377,7 +1402,6 @@ mod tests {
             ("REN_GREEDY", "1"),
             ("REN_REGEX", "1"),
             ("REN_WORD_REGEXP", "1"),
-            ("REN_PREVIEW", "1"),
             ("REN_DRY_RUN", "1"),
             ("REN_CREATE_DIRS", "true"),
         ]);
@@ -1396,7 +1420,9 @@ mod tests {
         assert!(cli.greedy);
         assert!(cli.regexp);
         assert!(cli.word_regexp);
-        assert!(cli.preview);
+        // Only one of the mode flags (dry-run/write/preview/list-files) can be
+        // set at a time. REN_PREVIEW would collide with REN_DRY_RUN at the
+        // same env tier - the dedicated mode-mutex tests cover that case.
         assert!(cli.dry_run);
         assert!(cli.create_dirs);
     }
@@ -1467,26 +1493,46 @@ mod tests {
     }
 
     #[test]
-    fn test_env_preview_composes_with_dry_run_flag() {
-        // `--preview` and `--dry-run` compose: REN_PREVIEW=1 with `-n` on the
-        // CLI ends up with both flags set. The runtime body uses preview to
-        // collect the accepted set, then prints (rather than applies) the plan.
-        let _g = EnvGuard::set(&[("REN_PREVIEW", "1")]);
+    fn test_cli_write_beats_shell_env_dry_run() {
+        // Mode-group precedence: CLI `--write` beats a shell-env REN_DRY_RUN.
+        let _g = EnvGuard::set(&[("REN_DRY_RUN", "1")]);
         let cli =
-            resolve_with_origin(&["ren", "-n", "foo", "bar"], &config::Origin::default()).unwrap();
-        assert!(cli.preview);
-        assert!(cli.dry_run);
+            resolve_with_origin(&["ren", "-W", "foo", "bar"], &config::Origin::default()).unwrap();
+        assert!(cli.write);
+        assert!(!cli.dry_run);
     }
 
     #[test]
-    fn test_preview_and_dry_run_compose() {
-        // `--preview --dry-run` is a legitimate user story: walk the prompts,
-        // accept/reject entries, then print the plan instead of touching the
-        // filesystem. The two flags have no `conflicts_with` relationship,
-        // so clap accepts both on the same command line.
-        let cli = parse_and_resolve(&["ren", "--preview", "--dry-run", "foo", "bar"]).unwrap();
-        assert!(cli.preview);
-        assert!(cli.dry_run);
+    fn test_write_and_dry_run_cli_conflict_errors() {
+        // The mode group makes write/dry-run/preview/list-files exclusive on
+        // the CLI tier; same-tier collisions error with both flag names.
+        let err = parse_and_resolve(&["ren", "--write", "--dry-run", "foo", "bar"])
+            .err()
+            .expect("CLI write/dry-run conflict expected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--write") && msg.contains("--dry-run"),
+            "expected CLI mutex error naming both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_and_preview_cli_conflict_errors() {
+        let err = parse_and_resolve(&["ren", "--write", "--preview", "foo", "bar"])
+            .err()
+            .expect("CLI write/preview conflict expected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--write") && msg.contains("--preview"),
+            "expected CLI mutex error naming both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_write_short_alias_y_parses() {
+        // `-y` is a hidden short alias for `-W` (kept off the help screen).
+        let cli = parse_cli(&["ren", "-y", "foo", "bar"]);
+        assert!(cli.write);
     }
 
     // ---- mutex resolver --------------------------------------------------

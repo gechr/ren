@@ -413,7 +413,7 @@ where
             // The two warning shapes differ because the file's stuck location
             // does: a failed phase-2 undo leaves the file at `new` (already
             // renamed), while a failed phase-1 undo leaves it at the internal
-            // temp path — which the user has to know about to recover it.
+            // temp path - which the user has to know about to recover it.
             for (done_entry, done_temp) in phase2_done.iter().rev() {
                 if let Err(re) = rename_op(&done_entry.new, done_temp) {
                     eprintln!(

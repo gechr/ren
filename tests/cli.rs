@@ -51,7 +51,7 @@ fn basic_rename_renames_only_matching_files() {
     fs::write(dir.path().join("foo.txt"), "").unwrap();
     fs::write(dir.path().join("bar.txt"), "").unwrap();
 
-    ren(&dir).args(["foo", "qux"]).assert().success();
+    ren(&dir).args(["-W", "foo", "qux"]).assert().success();
 
     assert!(dir.path().join("qux.txt").exists());
     assert!(!dir.path().join("foo.txt").exists());
@@ -66,7 +66,7 @@ fn default_scope_is_depth_one() {
     fs::create_dir(dir.path().join("sub")).unwrap();
     fs::write(dir.path().join("sub/foo.txt"), "").unwrap();
 
-    ren(&dir).args(["foo", "bar"]).assert().success();
+    ren(&dir).args(["-W", "foo", "bar"]).assert().success();
 
     // Top-level was renamed, nested file was not.
     assert!(dir.path().join("bar.txt").exists());
@@ -82,7 +82,10 @@ fn recursive_renames_at_all_depths() {
     fs::create_dir(dir.path().join("sub")).unwrap();
     fs::write(dir.path().join("sub/foo.txt"), "").unwrap();
 
-    ren(&dir).args(["-R", "foo", "bar"]).assert().success();
+    ren(&dir)
+        .args(["-W", "-R", "foo", "bar"])
+        .assert()
+        .success();
 
     assert!(dir.path().join("bar.txt").exists());
     assert!(!dir.path().join("foo.txt").exists());
@@ -101,7 +104,7 @@ fn include_dirs_with_recursive_renames_dir_then_nested_file() {
     fs::write(dir.path().join("foo_dir/foo_inner.txt"), "").unwrap();
 
     ren(&dir)
-        .args(["--include-dirs", "-R", "foo", "qux"])
+        .args(["-W", "--include-dirs", "-R", "foo", "qux"])
         .assert()
         .success();
 
@@ -128,11 +131,45 @@ fn dry_run_makes_no_filesystem_changes() {
 }
 
 #[test]
+fn dry_run_is_the_default_without_write_flag() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["foo", "bar"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would rename"));
+
+    assert!(dir.path().join("foo.txt").exists());
+    assert!(!dir.path().join("bar.txt").exists());
+}
+
+#[test]
+fn write_and_dry_run_together_is_a_mutex_error() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "--dry-run", "foo", "bar"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--write"))
+        .stderr(predicate::str::contains("--dry-run"));
+
+    // FS untouched.
+    assert!(dir.path().join("foo.txt").exists());
+}
+
+#[test]
 fn transform_only_single_file_path_is_renamed() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("Cargo.lock"), "").unwrap();
 
-    ren(&dir).args(["-L", "Cargo.lock"]).assert().success();
+    ren(&dir)
+        .args(["-W", "-L", "Cargo.lock"])
+        .assert()
+        .success();
 
     let names = read_dir_basenames(dir.path());
     assert!(names.contains("cargo.lock"));
@@ -165,7 +202,7 @@ fn case_only_rename_flips_dirent_via_temp_hop() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("tmp"), "").unwrap();
 
-    ren(&dir).args(["tmp", "TMP"]).assert().success();
+    ren(&dir).args(["-W", "tmp", "TMP"]).assert().success();
 
     let names = read_dir_basenames(dir.path());
     assert!(
@@ -208,7 +245,7 @@ fn smart_mode_renames_all_case_variants() {
     fs::write(dir.path().join("FooBar.tsx"), "").unwrap();
 
     ren(&dir)
-        .args(["--smart", "foo_bar", "hello_world"])
+        .args(["-W", "--smart", "foo_bar", "hello_world"])
         .assert()
         .success();
 
@@ -270,7 +307,7 @@ fn default_scope_renames_stem_and_reattaches_extension() {
     fs::write(dir.path().join("foo.rs"), "").unwrap();
     fs::write(dir.path().join("foo.tar.gz"), "").unwrap();
 
-    ren(&dir).args(["foo", "bar"]).assert().success();
+    ren(&dir).args(["-W", "foo", "bar"]).assert().success();
 
     assert!(dir.path().join("bar.rs").exists());
     assert!(dir.path().join("bar.tar.gz").exists());
@@ -285,7 +322,10 @@ fn include_extension_flag_matches_full_basename() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("report.txt"), "").unwrap();
 
-    ren(&dir).args(["-x", "txt", "notes"]).assert().success();
+    ren(&dir)
+        .args(["-W", "-x", "txt", "notes"])
+        .assert()
+        .success();
 
     assert!(dir.path().join("report.notes").exists());
     assert!(!dir.path().join("report.txt").exists());
@@ -299,7 +339,7 @@ fn only_extension_flag_matches_extension_and_preserves_stem() {
     fs::write(dir.path().join("foo.rs"), "").unwrap();
     fs::write(dir.path().join("Makefile"), "").unwrap();
 
-    ren(&dir).args(["-X", "rs", "txt"]).assert().success();
+    ren(&dir).args(["-W", "-X", "rs", "txt"]).assert().success();
 
     assert!(dir.path().join("foo.txt").exists());
     assert!(!dir.path().join("foo.rs").exists());
@@ -314,7 +354,7 @@ fn multiple_expressions_apply_in_order_in_one_pass() {
     fs::write(dir.path().join("foo_baz.txt"), "").unwrap();
 
     ren(&dir)
-        .args(["-e", "foo", "bar", "-e", "baz", "qux"])
+        .args(["-W", "-e", "foo", "bar", "-e", "baz", "qux"])
         .assert()
         .success();
 
@@ -339,7 +379,7 @@ fn stdin_mode_reads_newline_separated_paths() {
     fs::write(dir.path().join("foo_skip.txt"), "").unwrap();
 
     ren_stdin(&dir)
-        .args(["foo", "bar"])
+        .args(["-W", "foo", "bar"])
         .write_stdin("foo_a.txt\nfoo_b.txt\n")
         .assert()
         .success();
@@ -356,7 +396,7 @@ fn stdin_mode_with_null_splits_on_nul() {
     fs::write(dir.path().join("foo_b.txt"), "").unwrap();
 
     ren_stdin(&dir)
-        .args(["-0", "foo", "bar"])
+        .args(["-W", "-0", "foo", "bar"])
         .write_stdin("foo_a.txt\0foo_b.txt\0")
         .assert()
         .success();
@@ -373,6 +413,7 @@ fn create_dirs_makes_missing_parents_for_regex_target() {
 
     ren(&dir)
         .args([
+            "-W",
             "--create-dirs",
             "-x",
             "--regex",
@@ -395,7 +436,7 @@ fn missing_parent_without_create_dirs_fails_and_rolls_back() {
     fs::write(dir.path().join("a.log"), "").unwrap();
 
     ren(&dir)
-        .args(["-x", "--regex", r"^(.*)\.log$", "logs/$1.log", "."])
+        .args(["-W", "-x", "--regex", r"^(.*)\.log$", "logs/$1.log", "."])
         .assert()
         .failure();
 

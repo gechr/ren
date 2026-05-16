@@ -2,7 +2,9 @@
 
 `ren` is a fast bulk file renamer, sibling of [`rep`](https://github.com/gechr/rep).
 
-Where `rep` rewrites file *contents*, `ren` rewrites file *names*. Plain and regex find/replace, smart preserve-case rewrites, an interactive preview, glob filters, dry runs, listing, and multiple `-e/--expression` rewrites in a single pass.
+Where `rep` rewrites file *contents*, `ren` rewrites file *names*. Plain and regex find/replace, smart preserve-case rewrites, an interactive preview, glob filters, listing, and multiple `-e/--expression` rewrites in a single pass.
+
+`ren` is **dry-run by default** - every invocation prints the plan and exits. Pass `-W` (or `--write`) when you're ready to actually rename.
 
 ## Install
 
@@ -22,9 +24,14 @@ cargo install --git https://github.com/gechr/ren
 
 ## Examples
 
+Examples below show the *plan* - add `-W` to commit.
+
 ```sh
 # Replace `foo` with `bar` anywhere in basenames (cwd, files only)
 ren foo bar
+
+# Same, but actually rename
+ren -W foo bar
 
 # Recurse into subdirectories
 ren -R foo bar
@@ -51,23 +58,17 @@ ren --smart foo_bar hello_world
 # Regex rename: replace test_ prefix with spec_
 ren --regex '^test_' 'spec_'
 
-# Interactive preview before applying
+# Interactive preview: walks each entry and applies the accepted ones
 ren --preview foo bar
 
-# Plan only, don't touch the filesystem
-ren --dry-run foo bar
-
-# Preview the plan, accept/reject entries, then print (not apply)
-ren --preview --dry-run foo bar
-
 # Apply multiple replacements in a single pass
-ren -e foo bar -e baz qux
+ren -W -e foo bar -e baz qux
 
 # Print matching paths only (no rename)
 ren -l foo
 
 # Case-only rename (works on case-insensitive filesystems too)
-ren tmp TMP
+ren -W tmp TMP
 
 # Number every file in cwd: 01_alpha.txt, 02_beta.txt, ... (smart per-dir width)
 ren --prepend '{N}_'
@@ -126,4 +127,4 @@ By default the pipeline runs on the file stem only and the extension is reattach
 | `←` | go back and revise the previous decision  |
 | `→` | skip this rename                          |
 
-Combine with `--dry-run` to walk the prompts without touching the filesystem.
+Accepted renames are applied immediately - `--preview` is its own mode and is mutually exclusive with `--dry-run`/`--write`.
