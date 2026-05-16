@@ -403,7 +403,8 @@ fn print_help_long() {
   {green}${reset} ren --lower
 
   {grey}# Compose: find/replace → lower → append → prepend (fixed order){reset}
-  {green}${reset} ren --prepend '{{N}}_' --lower foo bar
+  {grey}# (use -e for find/replace when combining with a transform){reset}
+  {green}${reset} ren --prepend '{{N}}_' --lower -e foo bar
 "
     );
     print!("{text}");
@@ -434,11 +435,17 @@ impl Cli {
     }
 
     /// True when any transform flag (`--lower`, `--upper`, `--prepend`,
-    /// `--append`) is set. When true AND no `<find> <replace>` positionals
-    /// are provided, `<find> <replace>` is no longer required; positionals
-    /// become paths instead.
+    /// `--append`) is set.
     fn uses_transforms(&self) -> bool {
         self.lower || self.upper || self.append.is_some() || self.prepend.is_some()
+    }
+
+    /// True when a transform is present and no other mode (expressions,
+    /// list-files) claims the positionals. In this mode every positional is a
+    /// path; `<find> <replace>` requires `-e` instead, because the positional
+    /// shape would be ambiguous with the path list.
+    fn is_transforms_only(&self) -> bool {
+        self.uses_transforms() && !self.uses_expressions() && !self.is_find_only()
     }
 
     fn positional_skip(&self) -> usize {
@@ -448,9 +455,7 @@ impl Cli {
             // `-l` consumes the first positional as `<find>` when present;
             // with no positionals it lists every admitted file.
             self.args.len().min(1)
-        } else if self.uses_transforms() && self.args.len() < 2 {
-            // Transforms-only mode: no `<find> <replace>` was supplied; treat
-            // positionals as paths to walk.
+        } else if self.is_transforms_only() {
             0
         } else {
             2
@@ -792,13 +797,11 @@ fn colorized_rename_line(old: &str, new: &str) -> String {
 /// of the clap surface.
 fn compile_options_from_cli(cli: &Cli) -> CompileOptions {
     let find_only = cli.is_find_only();
-    // In transforms-only mode (transforms set, no `-e`, no `-l`, < 2
-    // positionals), the surviving positionals are paths to walk - NOT a find
-    // pattern. Suppress positional_find/replace so `compile_expressions`
-    // produces an empty expression list and `build_plan` runs the transform
-    // pipeline as the sole stage.
-    let transforms_only =
-        cli.uses_transforms() && !cli.uses_expressions() && !find_only && cli.args.len() < 2;
+    // In transforms-only mode, every surviving positional is a path to walk -
+    // NOT a find pattern. Suppress positional_find/replace so
+    // `compile_expressions` produces an empty expression list and `build_plan`
+    // runs the transform pipeline as the sole stage.
+    let transforms_only = cli.is_transforms_only();
 
     let positional_find = if cli.uses_expressions() || cli.args.is_empty() || transforms_only {
         None
@@ -1281,6 +1284,36 @@ mod tests {
             parse_cli(&["ren", "-R", "--include-dirs", "a", "b"]).positional_skip(),
             2
         );
+        // Transforms-only mode: every positional is a path, regardless of
+        // count. Without this, `ren -U a b c` silently stole `a b` as
+        // find/replace and only operated on `c`.
+        assert_eq!(parse_cli(&["ren", "-U"]).positional_skip(), 0);
+        assert_eq!(parse_cli(&["ren", "-U", "a"]).positional_skip(), 0);
+        assert_eq!(parse_cli(&["ren", "-U", "a", "b"]).positional_skip(), 0);
+        assert_eq!(parse_cli(&["ren", "-U", "a", "b", "c"]).positional_skip(), 0);
+        assert_eq!(parse_cli(&["ren", "-L", "a", "b"]).positional_skip(), 0);
+        assert_eq!(
+            parse_cli(&["ren", "-A", "_suffix", "a", "b"]).positional_skip(),
+            0
+        );
+        assert_eq!(
+            parse_cli(&["ren", "-P", "pfx_", "a", "b"]).positional_skip(),
+            0
+        );
+        // Expression mode wins over transforms: `-e` already implies
+        // positionals are paths.
+        assert_eq!(
+            parse_cli(&["ren", "-e", "a", "b", "-U", "x", "y"]).positional_skip(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_transforms_only_treats_all_positionals_as_paths() {
+        // Behavior-level: `dirs()` returns every positional, not a subset
+        // sliced past a phantom `<find> <replace>` pair.
+        let cli = parse_cli(&["ren", "-U", "a", "b", "c"]);
+        assert_eq!(cli.dirs(), vec!["a", "b", "c"]);
     }
 
     // ---- is_find_only -----------------------------------------------------
