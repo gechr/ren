@@ -706,7 +706,7 @@ pub(crate) fn preprocess_expression_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
-fn display_path(path: &std::path::Path) -> String {
+pub(crate) fn display_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     s.strip_prefix("./").unwrap_or(&s).to_string()
 }
@@ -1290,7 +1290,10 @@ mod tests {
         assert_eq!(parse_cli(&["ren", "-U"]).positional_skip(), 0);
         assert_eq!(parse_cli(&["ren", "-U", "a"]).positional_skip(), 0);
         assert_eq!(parse_cli(&["ren", "-U", "a", "b"]).positional_skip(), 0);
-        assert_eq!(parse_cli(&["ren", "-U", "a", "b", "c"]).positional_skip(), 0);
+        assert_eq!(
+            parse_cli(&["ren", "-U", "a", "b", "c"]).positional_skip(),
+            0
+        );
         assert_eq!(parse_cli(&["ren", "-L", "a", "b"]).positional_skip(), 0);
         assert_eq!(
             parse_cli(&["ren", "-A", "_suffix", "a", "b"]).positional_skip(),

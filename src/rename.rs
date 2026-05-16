@@ -26,6 +26,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use anyhow::anyhow;
 
+use crate::display_path;
 use crate::expressions;
 use crate::scan;
 use crate::transforms;
@@ -278,13 +279,20 @@ pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
     }
     let dup_groups: Vec<_> = by_new.iter().filter(|(_, v)| v.len() > 1).collect();
     if !dup_groups.is_empty() {
-        let mut msg = String::from("rename plan has within-plan conflicts:");
-        for (key, entries) in &dup_groups {
-            let sources: Vec<String> = entries
-                .iter()
-                .map(|e| e.old.display().to_string())
-                .collect();
-            write!(msg, "\n  {key} ← {}", sources.join(", ")).expect("write to String never fails");
+        let mut msg = String::from("multiple files would be renamed to the same target:\n");
+        for (i, (_, entries)) in dup_groups.iter().enumerate() {
+            if i > 0 {
+                msg.push('\n');
+            }
+            for entry in *entries {
+                write!(
+                    msg,
+                    "\n  {} → {}",
+                    display_path(&entry.old),
+                    display_path(&entry.new)
+                )
+                .expect("write to String never fails");
+            }
         }
         return Err(anyhow!("{msg}"));
     }
@@ -308,9 +316,9 @@ pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
         }
     }
     if !external.is_empty() {
-        let mut msg = String::from("rename plan would overwrite existing paths:");
+        let mut msg = String::from("renames would overwrite existing files:\n");
         for (old, new) in external {
-            write!(msg, "\n  {} -> {}", old.display(), new.display())
+            write!(msg, "\n  {} → {}", display_path(old), display_path(new))
                 .expect("write to String never fails");
         }
         return Err(anyhow!("{msg}"));

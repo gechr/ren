@@ -230,7 +230,9 @@ fn duplicate_target_is_a_validation_error() {
         .args(["-x", "--regex", r"^[ab]\.txt$", "c.txt"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("within-plan conflicts"));
+        .stderr(predicate::str::contains(
+            "multiple files would be renamed to the same target",
+        ));
 
     // Validation must reject before applying anything.
     assert!(dir.path().join("a.txt").exists());
