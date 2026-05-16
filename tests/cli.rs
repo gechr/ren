@@ -15,9 +15,21 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 /// `ren` binary cwd-set to `dir`. Stdin is nulled so `ren`'s auto-detection
-/// doesn't trip on the FIFO that `assert_cmd::Command` would attach.
+/// doesn't trip on the FIFO that `assert_cmd::Command` would attach. All
+/// `REN_*` env vars are scrubbed so the developer's shell can't bleed into
+/// snapshot assertions, and `REN_CONFIG_PATH=""` disables the
+/// `~/.config/ren/config.toml` lookup. Tests that exercise env or config
+/// behavior can `.env(...)` back in selectively.
 fn ren(dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("ren").expect("ren binary built by cargo");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("REN_") {
+            cmd.env_remove(&key);
+        }
+    }
+    // Empty (not unset) means "no config file"; an unset value would fall
+    // through to the default `~/.config/ren/config.toml` lookup.
+    cmd.env("REN_CONFIG_PATH", "");
     cmd.current_dir(dir.path()).stdin(Stdio::null());
     cmd
 }

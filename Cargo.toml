@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crossterm = "0.29"
 ignore = "0.4"
@@ -17,6 +17,8 @@ Inflector = "0.11"
 natord = "1.0"
 num-format = { version = "0.4", features = ["with-system-locale"] }
 regex = "1.5"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

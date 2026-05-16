@@ -1,15 +1,20 @@
+mod config;
 mod expressions;
 mod io;
 mod preview;
 mod rename;
 mod scan;
+#[cfg(test)]
+mod test_env;
 mod transforms;
 
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
-use clap::{CommandFactory as _, Parser};
+use clap::builder::BoolishValueParser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use clap_complete::Shell;
 
 use crate::expressions::{CompileOptions, EXPR_SEP, compile_expressions};
@@ -37,19 +42,38 @@ struct Cli {
     null: bool,
 
     /// Include hidden files
-    #[arg(short = 'H', long = "hidden")]
+    #[arg(
+        short = 'H',
+        long = "hidden",
+        env = "REN_HIDDEN",
+        value_parser = BoolishValueParser::new()
+    )]
     hidden: bool,
 
     /// Ignore .gitignore / .ignore / .git/info/exclude
-    #[arg(long = "no-ignore")]
+    #[arg(
+        long = "no-ignore",
+        env = "REN_NO_IGNORE",
+        value_parser = BoolishValueParser::new()
+    )]
     no_ignore: bool,
 
     /// Recurse into subdirectories
-    #[arg(short = 'R', long = "recursive")]
+    #[arg(
+        short = 'R',
+        long = "recursive",
+        env = "REN_RECURSIVE",
+        value_parser = BoolishValueParser::new()
+    )]
     recursive: bool,
 
     /// Admit directories into the rename plan
-    #[arg(short = 'd', long = "include-dirs")]
+    #[arg(
+        short = 'd',
+        long = "include-dirs",
+        env = "REN_INCLUDE_DIRS",
+        value_parser = BoolishValueParser::new()
+    )]
     include_dirs: bool,
 
     /// Include file extension in matching and replacement
@@ -61,7 +85,8 @@ struct Cli {
     #[arg(
         short = 'x',
         long = "include-extension",
-        conflicts_with = "only_extension"
+        env = "REN_INCLUDE_EXTENSION",
+        value_parser = BoolishValueParser::new()
     )]
     include_extension: bool,
 
@@ -69,31 +94,67 @@ struct Cli {
     ///
     /// The pipeline runs on the extension only; the stem is preserved
     /// verbatim. Files without an extension are skipped.
-    #[arg(short = 'X', long = "only-extension")]
+    #[arg(
+        short = 'X',
+        long = "only-extension",
+        env = "REN_ONLY_EXTENSION",
+        value_parser = BoolishValueParser::new()
+    )]
     only_extension: bool,
 
     /// Greedy matching
-    #[arg(short = 'G', long = "greedy")]
+    #[arg(
+        short = 'G',
+        long = "greedy",
+        env = "REN_GREEDY",
+        value_parser = BoolishValueParser::new()
+    )]
     greedy: bool,
 
     /// Case-insensitive
-    #[arg(short = 'i', long = "ignore-case")]
+    #[arg(
+        short = 'i',
+        long = "ignore-case",
+        env = "REN_IGNORE_CASE",
+        value_parser = BoolishValueParser::new()
+    )]
     ignore_case: bool,
 
     /// Use regex
-    #[arg(short = 'r', long = "regex", alias = "regexp")]
+    #[arg(
+        short = 'r',
+        long = "regex",
+        alias = "regexp",
+        env = "REN_REGEX",
+        value_parser = BoolishValueParser::new()
+    )]
     regexp: bool,
 
     /// Preserve-case replacement
-    #[arg(short = 'S', long = "smart")]
+    #[arg(
+        short = 'S',
+        long = "smart",
+        env = "REN_SMART",
+        value_parser = BoolishValueParser::new()
+    )]
     smart: bool,
 
     /// Lowercase the name
-    #[arg(short = 'L', long = "lower", conflicts_with = "upper")]
+    #[arg(
+        short = 'L',
+        long = "lower",
+        env = "REN_LOWER",
+        value_parser = BoolishValueParser::new()
+    )]
     lower: bool,
 
     /// Uppercase the name
-    #[arg(short = 'U', long = "upper")]
+    #[arg(
+        short = 'U',
+        long = "upper",
+        env = "REN_UPPER",
+        value_parser = BoolishValueParser::new()
+    )]
     upper: bool,
 
     /// Prepend a literal string or template to each name
@@ -101,13 +162,13 @@ struct Cli {
     /// Templates: `{n}` substitutes a 1-based per-parent-directory counter;
     /// `{n:0WIDTH}` zero-pads to `WIDTH` digits; `{N}` zero-pads to a smart
     /// per-parent width. `--prepend` and `--append` share the same counter.
-    #[arg(short = 'P', long = "prepend", value_name = "FMT")]
+    #[arg(short = 'P', long = "prepend", value_name = "FMT", env = "REN_PREPEND")]
     prepend: Option<String>,
 
     /// Append a literal string or template to each name
     ///
     /// See `--prepend` for the templating DSL.
-    #[arg(short = 'A', long = "append", value_name = "FMT")]
+    #[arg(short = 'A', long = "append", value_name = "FMT", env = "REN_APPEND")]
     append: Option<String>,
 
     /// Find replace expression
@@ -115,7 +176,12 @@ struct Cli {
     expressions: Vec<String>,
 
     /// Whole words only
-    #[arg(short = 'w', long = "word-regexp")]
+    #[arg(
+        short = 'w',
+        long = "word-regexp",
+        env = "REN_WORD_REGEXP",
+        value_parser = BoolishValueParser::new()
+    )]
     word_regexp: bool,
 
     /// Print matching file paths
@@ -126,15 +192,30 @@ struct Cli {
     ///
     /// Composes with `--preview`: prompts the user to accept/reject each entry,
     /// then prints the would-rename plan instead of applying it.
-    #[arg(short = 'n', long = "dry-run", alias = "dry")]
+    #[arg(
+        short = 'n',
+        long = "dry-run",
+        alias = "dry",
+        env = "REN_DRY_RUN",
+        value_parser = BoolishValueParser::new()
+    )]
     dry_run: bool,
 
     /// Interactive preview
-    #[arg(short = 'p', long = "preview")]
+    #[arg(
+        short = 'p',
+        long = "preview",
+        env = "REN_PREVIEW",
+        value_parser = BoolishValueParser::new()
+    )]
     preview: bool,
 
     /// Create missing parent directories for rename targets.
-    #[arg(long = "create-dirs")]
+    #[arg(
+        long = "create-dirs",
+        env = "REN_CREATE_DIRS",
+        value_parser = BoolishValueParser::new()
+    )]
     create_dirs: bool,
 
     #[arg(long = "completions", value_name = "SHELL", hide = true)]
@@ -208,7 +289,7 @@ fn print_help() {
 
       {red}--create-dirs{reset}         Create missing parent directories
 
-  {red}-l{reset}, {red}--list-files{reset}          Print only file paths whose names match
+  {red}-l{reset}, {red}--list-files{reset}          Print matching file paths (no rename)
 
   {red}-n{reset}, {red}--dry-run{reset}             Show what would be changed without renaming
   {red}-p{reset}, {red}--preview{reset}             Preview the changes before applying them
@@ -256,6 +337,9 @@ fn print_help_long() {
 
   {grey}# Restrict to .rs files{reset}
   {green}${reset} ren -f rs old new
+
+  {grey}# List every .go file (no rename){reset}
+  {green}${reset} ren -f go -l
 
   {grey}# Stem-only matching is the default (api_v1.json → api_v2.json){reset}
   {green}${reset} ren v1 v2
@@ -311,60 +395,16 @@ fn print_help_long() {
 }
 
 impl Cli {
-    /// Fill in defaults from `REN_*` env vars. CLI flags take precedence:
-    /// for booleans, an explicit `--flag` (true) is never overridden; for
-    /// `Option<T>`, env only fills when the flag is absent (`None`).
-    fn apply_env_defaults(&mut self) {
-        self.apply_env_defaults_with(|k| std::env::var(k).ok());
-    }
-
-    /// Testable core of `apply_env_defaults`.
-    fn apply_env_defaults_with(&mut self, get: impl Fn(&str) -> Option<String>) {
-        // Truthy: "1", "true" (case-insensitive). Anything else is false.
-        let bool_var = |k| {
-            get(k)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
-                .unwrap_or(false)
-        };
-        // String env vars: empty string is treated as "unset".
-        let str_var = |k| get(k).filter(|v| !v.is_empty());
-
-        self.hidden |= bool_var("REN_HIDDEN");
-        self.no_ignore |= bool_var("REN_NO_IGNORE");
-        self.recursive |= bool_var("REN_RECURSIVE");
-        self.include_dirs |= bool_var("REN_INCLUDE_DIRS");
-        self.include_extension |= bool_var("REN_INCLUDE_EXTENSION");
-        self.only_extension |= bool_var("REN_ONLY_EXTENSION");
-        self.greedy |= bool_var("REN_GREEDY");
-        self.ignore_case |= bool_var("REN_IGNORE_CASE");
-        self.regexp |= bool_var("REN_REGEXP");
-
-        self.smart |= bool_var("REN_SMART");
-        self.preview |= bool_var("REN_PREVIEW");
-
-        // Transforms. `--lower` and `--upper` are mutex at the clap layer;
-        // env-side we just OR each in independently. If both env vars are
-        // set the user gets a runtime conflict caught downstream by
-        // `transforms::apply` (lower wins, see its tests).
-        self.lower |= bool_var("REN_LOWER");
-        self.upper |= bool_var("REN_UPPER");
-        // For `Option<String>` env vars, only fill when the CLI flag is absent.
-        if self.append.is_none() {
-            self.append = str_var("REN_APPEND");
-        }
-        if self.prepend.is_none() {
-            self.prepend = str_var("REN_PREPEND");
-        }
-    }
-
     fn uses_expressions(&self) -> bool {
         !self.expressions.is_empty()
     }
 
     /// True when the CLI takes only `<find>` (no `<replace>`).
     ///
-    /// `-l`/`--list-files` without `-e` consumes only `<find>`; all remaining
-    /// positionals are search roots.
+    /// `-l`/`--list-files` without `-e` consumes at most `<find>`; the find
+    /// pattern is optional, and all remaining positionals are search roots.
+    /// When no `<find>` is supplied, `-l` lists every file the other filters
+    /// admit.
     fn is_find_only(&self) -> bool {
         !self.uses_expressions() && self.list_files
     }
@@ -390,7 +430,9 @@ impl Cli {
         if self.uses_expressions() {
             0
         } else if self.is_find_only() {
-            1
+            // `-l` consumes the first positional as `<find>` when present;
+            // with no positionals it lists every admitted file.
+            self.args.len().min(1)
         } else if self.uses_transforms() && self.args.len() < 2 {
             // Transforms-only mode: no `<find> <replace>` was supplied; treat
             // positionals as paths to walk.
@@ -439,6 +481,165 @@ impl Cli {
     fn replacement(&self) -> &str {
         &self.args[1]
     }
+}
+
+/// Enforce the `config < env < CLI` precedence policy across mutually
+/// exclusive flags. The winner of each group is the highest-priority "true"
+/// flag (CLI > shell env > config-derived env); the losers are cleared in
+/// the resolved `Cli` so dispatch logic only sees one active flag per group.
+/// Returns an error when two flags in the same group both come from the
+/// same source tier (two CLI flags, two shell env vars, or two config
+/// entries) - the genuine ambiguity cases.
+fn resolve_mutex_groups(
+    cli: &mut Cli,
+    matches: &ArgMatches,
+    origin: &config::Origin,
+) -> Result<()> {
+    let case = resolve_group(matches, origin, &["lower", "upper"])?;
+    cli.lower = case == Some("lower");
+    cli.upper = case == Some("upper");
+
+    let ext = resolve_group(matches, origin, &["include_extension", "only_extension"])?;
+    cli.include_extension = ext == Some("include_extension");
+    cli.only_extension = ext == Some("only_extension");
+
+    // Empty-string values for `Option<String>` env vars come through as
+    // `Some("")`, which would trip `uses_transforms()` and silently switch
+    // ren into transforms-only mode. Treat them as "unset" instead - matches
+    // the prior `apply_env_defaults` behavior and the principle that a
+    // missing template is not a request for a zero-length template.
+    if cli.prepend.as_deref() == Some("") {
+        cli.prepend = None;
+    }
+    if cli.append.as_deref() == Some("") {
+        cli.append = None;
+    }
+
+    Ok(())
+}
+
+/// Pick the winner of an "at most one is true" group. Higher tier wins;
+/// same-tier conflicts are errors with wording specific to the source.
+fn resolve_group<'a>(
+    matches: &ArgMatches,
+    origin: &config::Origin,
+    ids: &[&'a str],
+) -> Result<Option<&'a str>> {
+    let mut by_tier: [Vec<&'a str>; Tier::COUNT] = std::array::from_fn(|_| Vec::new());
+    for id in ids {
+        if !matches.get_flag(id) {
+            continue;
+        }
+        if let Some(tier) = tier_of(id, matches, origin) {
+            by_tier[tier.index()].push(*id);
+        }
+    }
+    // Walk tiers high-to-low: the highest-priority tier with any active
+    // flag determines the winner. Same-tier ties become source-aware errors.
+    for tier in [Tier::Cli, Tier::ShellEnv, Tier::Config] {
+        let ids_in_tier = &by_tier[tier.index()];
+        if ids_in_tier.len() > 1 {
+            bail!(same_tier_error(tier, ids_in_tier));
+        }
+        if let Some(id) = ids_in_tier.first() {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Source tier for precedence resolution. Higher discriminant = higher
+/// priority. The explicit `index` method (rather than `as usize` casts at
+/// call sites) gives the compiler a chance to enforce exhaustiveness if a
+/// variant is added.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    Config,
+    ShellEnv,
+    Cli,
+}
+
+impl Tier {
+    const COUNT: usize = 3;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Config => 0,
+            Self::ShellEnv => 1,
+            Self::Cli => 2,
+        }
+    }
+}
+
+fn tier_of(id: &str, matches: &ArgMatches, origin: &config::Origin) -> Option<Tier> {
+    match matches.value_source(id) {
+        Some(ValueSource::CommandLine) => Some(Tier::Cli),
+        Some(ValueSource::EnvVariable) => {
+            let env_name = arg_env_name(id)?;
+            if origin.is_config_derived(env_name) {
+                Some(Tier::Config)
+            } else {
+                Some(Tier::ShellEnv)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn same_tier_error(tier: Tier, ids: &[&str]) -> String {
+    let names: Vec<String> = ids.iter().map(|id| (*id).replace('_', "-")).collect();
+    match tier {
+        Tier::Cli => format!(
+            "the following flags cannot be used together: {}",
+            names
+                .iter()
+                .map(|n| format!("--{n}"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ),
+        Tier::ShellEnv => format!(
+            "conflicting environment variables: {}",
+            ids.iter()
+                .map(|id| arg_env_name(id)
+                    .map_or_else(|| format!("REN_{}", id.to_ascii_uppercase()), str::to_owned))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ),
+        Tier::Config => format!(
+            "config sets conflicting keys: {}",
+            names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ),
+    }
+}
+
+/// Map a clap arg id to its declared `REN_*` env var name. Returns `None`
+/// for ids without an `env = ...` attribute - those can't be config-derived.
+fn arg_env_name(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "hidden" => "REN_HIDDEN",
+        "no_ignore" => "REN_NO_IGNORE",
+        "recursive" => "REN_RECURSIVE",
+        "include_dirs" => "REN_INCLUDE_DIRS",
+        "include_extension" => "REN_INCLUDE_EXTENSION",
+        "only_extension" => "REN_ONLY_EXTENSION",
+        "greedy" => "REN_GREEDY",
+        "ignore_case" => "REN_IGNORE_CASE",
+        "regexp" => "REN_REGEX",
+        "word_regexp" => "REN_WORD_REGEXP",
+        "smart" => "REN_SMART",
+        "lower" => "REN_LOWER",
+        "upper" => "REN_UPPER",
+        "prepend" => "REN_PREPEND",
+        "append" => "REN_APPEND",
+        "dry_run" => "REN_DRY_RUN",
+        "preview" => "REN_PREVIEW",
+        "create_dirs" => "REN_CREATE_DIRS",
+        _ => return None,
+    })
 }
 
 /// Preprocess argv so that `-e <find> <replace>` is compacted into a single
@@ -744,8 +945,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut cli = Cli::parse_from(preprocess_expression_args(std::env::args().collect()));
-    cli.apply_env_defaults();
+    let argv: Vec<_> = std::env::args().collect();
+    let cfg_origin = config::load_into_env();
+    let matches = Cli::command().get_matches_from(preprocess_expression_args(argv));
+    let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
+    resolve_mutex_groups(&mut cli, &matches, &cfg_origin)?;
+    // Clear config-synthesized env so spawned subprocesses inherit only the
+    // user's real shell env.
+    cfg_origin.unset_synthesized();
 
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "ren", &mut std::io::stdout());
@@ -823,13 +1030,15 @@ fn run() -> Result<()> {
 
     if cli.list_files {
         // Iterate records, print each whose basename matches at least one
-        // expression's regex. `walk_paths` already returns natord-sorted
-        // results, so no further sorting needed.
+        // expression's regex. With no expressions (no `<find>` and no `-e`),
+        // every admitted record is printed - the other filters (`-f`, paths,
+        // `-R`, ...) already narrowed the set. `walk_paths` returns
+        // natord-sorted results, so no further sorting needed.
         for record in &records {
             let Some(basename) = record.path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if exprs.iter().any(|e| e.regex.is_match(basename)) {
+            if exprs.is_empty() || exprs.iter().any(|e| e.regex.is_match(basename)) {
                 println!("{}", display_path(&record.path));
             }
         }
@@ -885,9 +1094,44 @@ fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::test_env::{EnvGuard, lock_for_parse};
+
     fn parse_cli(args: &[&str]) -> Cli {
+        let _lock = lock_for_parse();
         let processed = preprocess_expression_args(args.iter().map(|s| s.to_string()).collect());
         Cli::parse_from(processed)
+    }
+
+    /// Resolver helper for env-aware tests. The caller must hold an
+    /// [`EnvGuard`] for the duration of this call - the matches read env
+    /// state and would race with a concurrent mutator.
+    fn resolve_with_origin(args: &[&str], origin: &config::Origin) -> Result<Cli> {
+        let processed = preprocess_expression_args(args.iter().map(|s| (*s).to_string()).collect());
+        let matches = Cli::command().try_get_matches_from(processed)?;
+        let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
+        resolve_mutex_groups(&mut cli, &matches, origin)?;
+        Ok(cli)
+    }
+
+    /// Resolver helper for tests that DON'T mutate env. Acquires
+    /// [`ENV_MUTEX`] and scrubs ambient `REN_*` vars internally so that
+    /// concurrent env-mutating tests (which take the same lock via
+    /// `EnvGuard`) can't leak state into clap's parse. The mutex is held
+    /// only for the parse + resolve; reads of the returned `Cli` are safe.
+    fn parse_and_resolve(args: &[&str]) -> Result<Cli> {
+        let _lock = lock_for_parse();
+        resolve_with_origin(args, &config::Origin::default())
+    }
+
+    /// Build a config `Origin` claiming the given env var names are
+    /// config-derived. Used to simulate `apply_to_env` having projected
+    /// values onto the environment without actually loading a config file.
+    fn fake_config_origin(keys: &'static [&'static str]) -> config::Origin {
+        let mut origin = config::Origin::default();
+        for k in keys {
+            origin.mark_as_config_derived(k);
+        }
+        origin
     }
 
     // ---- delegated parse_file_globs smoke ---------------------------------
@@ -954,14 +1198,14 @@ mod tests {
 
     #[test]
     fn test_cli_is_regex_any_flag_enables_regex() {
-        assert!(!Cli::parse_from(["ren", "a", "b"]).is_regex());
-        assert!(Cli::parse_from(["ren", "-r", "a", "b"]).is_regex());
-        assert!(Cli::parse_from(["ren", "-i", "a", "b"]).is_regex());
-        assert!(Cli::parse_from(["ren", "-w", "a", "b"]).is_regex());
-        assert!(Cli::parse_from(["ren", "-G", "a", "b"]).is_regex());
+        assert!(!parse_cli(&["ren", "a", "b"]).is_regex());
+        assert!(parse_cli(&["ren", "-r", "a", "b"]).is_regex());
+        assert!(parse_cli(&["ren", "-i", "a", "b"]).is_regex());
+        assert!(parse_cli(&["ren", "-w", "a", "b"]).is_regex());
+        assert!(parse_cli(&["ren", "-G", "a", "b"]).is_regex());
         // Recursion / include-dirs do not flip is_regex.
-        assert!(!Cli::parse_from(["ren", "-R", "a", "b"]).is_regex());
-        assert!(!Cli::parse_from(["ren", "--include-dirs", "a", "b"]).is_regex());
+        assert!(!parse_cli(&["ren", "-R", "a", "b"]).is_regex());
+        assert!(!parse_cli(&["ren", "--include-dirs", "a", "b"]).is_regex());
     }
 
     // ---- positional_skip --------------------------------------------------
@@ -969,26 +1213,21 @@ mod tests {
     #[test]
     fn test_cli_positional_skip() {
         // find+replace mode: skip 2 positional args
-        assert_eq!(Cli::parse_from(["ren", "a", "b"]).positional_skip(), 2);
+        assert_eq!(parse_cli(&["ren", "a", "b"]).positional_skip(), 2);
         // expression mode: no positional find/replace
         assert_eq!(parse_cli(&["ren", "-e", "a", "b"]).positional_skip(), 0);
-        // -l always consumes only the find pattern.
-        assert_eq!(Cli::parse_from(["ren", "-l", "a"]).positional_skip(), 1);
-        assert_eq!(
-            Cli::parse_from(["ren", "-l", "a", "b"]).positional_skip(),
-            1
-        );
+        // -l consumes the first positional as <find> when present, 0 otherwise.
+        assert_eq!(parse_cli(&["ren", "-l"]).positional_skip(), 0);
+        assert_eq!(parse_cli(&["ren", "-l", "a"]).positional_skip(), 1);
+        assert_eq!(parse_cli(&["ren", "-l", "a", "b"]).positional_skip(), 1);
         // -R / --include-dirs are bool flags; they don't change positional layout.
+        assert_eq!(parse_cli(&["ren", "-R", "a", "b"]).positional_skip(), 2);
         assert_eq!(
-            Cli::parse_from(["ren", "-R", "a", "b"]).positional_skip(),
+            parse_cli(&["ren", "--include-dirs", "a", "b"]).positional_skip(),
             2
         );
         assert_eq!(
-            Cli::parse_from(["ren", "--include-dirs", "a", "b"]).positional_skip(),
-            2
-        );
-        assert_eq!(
-            Cli::parse_from(["ren", "-R", "--include-dirs", "a", "b"]).positional_skip(),
+            parse_cli(&["ren", "-R", "--include-dirs", "a", "b"]).positional_skip(),
             2
         );
     }
@@ -997,16 +1236,16 @@ mod tests {
 
     #[test]
     fn test_cli_is_find_only() {
-        assert!(Cli::parse_from(["ren", "-l", "a"]).is_find_only());
-        assert!(Cli::parse_from(["ren", "-l", "a", "b"]).is_find_only());
-        assert!(!Cli::parse_from(["ren", "a", "b"]).is_find_only());
+        assert!(parse_cli(&["ren", "-l", "a"]).is_find_only());
+        assert!(parse_cli(&["ren", "-l", "a", "b"]).is_find_only());
+        assert!(!parse_cli(&["ren", "a", "b"]).is_find_only());
         // -l with -e is expression mode, not find-only
         assert!(!parse_cli(&["ren", "-l", "-e", "a", "b"]).is_find_only());
     }
 
     #[test]
     fn test_list_files_mode_treats_trailing_positionals_as_paths() {
-        let cli = Cli::parse_from(["ren", "-l", "TODO", "src", "tests"]);
+        let cli = parse_cli(&["ren", "-l", "TODO", "src", "tests"]);
         assert_eq!(cli.positional_skip(), 1);
         assert_eq!(cli.pattern(), "TODO");
         assert_eq!(
@@ -1015,22 +1254,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_list_files_without_find_pattern() {
+        // `ren -l` and `ren -f <glob> -l` are list-only modes with no <find>:
+        // every walked record passes through.
+        let bare = parse_cli(&["ren", "-l"]);
+        assert_eq!(bare.positional_skip(), 0);
+        assert!(bare.paths().is_empty());
+        assert_eq!(bare.dirs(), vec!["."]);
+
+        let filtered = parse_cli(&["ren", "-f", "go", "-l"]);
+        assert_eq!(filtered.positional_skip(), 0);
+        assert!(filtered.paths().is_empty());
+        assert_eq!(filtered.files.as_deref(), Some("go"));
+    }
+
     // ---- dirs / paths with new flags --------------------------------------
 
     #[test]
     fn test_cli_dirs_defaults_to_current_directory() {
-        assert_eq!(Cli::parse_from(["ren", "a", "b"]).dirs(), vec!["."]);
+        assert_eq!(parse_cli(&["ren", "a", "b"]).dirs(), vec!["."]);
     }
 
     #[test]
     fn test_cli_dirs_uses_trailing_positionals() {
-        let cli = Cli::parse_from(["ren", "a", "b", "src", "tests"]);
+        let cli = parse_cli(&["ren", "a", "b", "src", "tests"]);
         assert_eq!(cli.dirs(), vec!["src", "tests"]);
     }
 
     #[test]
     fn test_cli_paths_skips_find_and_replace() {
-        let cli = Cli::parse_from(["ren", "a", "b", "src", "tests"]);
+        let cli = parse_cli(&["ren", "a", "b", "src", "tests"]);
         assert_eq!(
             cli.paths(),
             vec![PathBuf::from("src"), PathBuf::from("tests")]
@@ -1040,7 +1294,7 @@ mod tests {
     #[test]
     fn test_cli_dirs_with_recursive_flag_unchanged() {
         // `-R` is a boolean - it must not consume a positional.
-        let cli = Cli::parse_from(["ren", "-R", "a", "b", "src"]);
+        let cli = parse_cli(&["ren", "-R", "a", "b", "src"]);
         assert_eq!(cli.dirs(), vec!["src"]);
         assert_eq!(cli.paths(), vec![PathBuf::from("src")]);
         assert!(cli.recursive);
@@ -1048,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_cli_dirs_with_include_dirs_flag_unchanged() {
-        let cli = Cli::parse_from(["ren", "--include-dirs", "a", "b", "src"]);
+        let cli = parse_cli(&["ren", "--include-dirs", "a", "b", "src"]);
         assert_eq!(cli.dirs(), vec!["src"]);
         assert_eq!(cli.paths(), vec![PathBuf::from("src")]);
         assert!(cli.include_dirs);
@@ -1056,11 +1310,11 @@ mod tests {
 
     #[test]
     fn test_transform_short_flags_parse() {
-        let lower = Cli::parse_from(["ren", "-L"]);
+        let lower = parse_cli(&["ren", "-L"]);
         assert!(lower.lower);
         assert!(!lower.upper);
 
-        let upper = Cli::parse_from(["ren", "-U"]);
+        let upper = parse_cli(&["ren", "-U"]);
         assert!(upper.upper);
         assert!(!upper.lower);
     }
@@ -1070,7 +1324,7 @@ mod tests {
         // The append value here intentionally starts with `-` to lock in
         // that the `=`-attached form is the way to pass dashed templates;
         // the bare `-A -{n}` form trips clap's flag-vs-value heuristic.
-        let cli = Cli::parse_from(["ren", "-P", "{N}_", "-A=-{n}"]);
+        let cli = parse_cli(&["ren", "-P", "{N}_", "-A=-{n}"]);
         assert_eq!(cli.prepend.as_deref(), Some("{N}_"));
         assert_eq!(cli.append.as_deref(), Some("-{n}"));
     }
@@ -1086,44 +1340,83 @@ mod tests {
 
     #[test]
     fn test_env_defaults_enable_boolean_flags() {
-        let env = std::collections::HashMap::from([
+        let _g = EnvGuard::set(&[
             ("REN_HIDDEN", "1"),
             ("REN_NO_IGNORE", "true"),
             ("REN_RECURSIVE", "1"),
             ("REN_INCLUDE_DIRS", "true"),
             ("REN_INCLUDE_EXTENSION", "1"),
-            ("REN_ONLY_EXTENSION", "1"),
             ("REN_SMART", "TRUE"),
             ("REN_IGNORE_CASE", "1"),
             ("REN_GREEDY", "1"),
-            ("REN_REGEXP", "1"),
+            ("REN_REGEX", "1"),
+            ("REN_WORD_REGEXP", "1"),
             ("REN_PREVIEW", "1"),
+            ("REN_DRY_RUN", "1"),
+            ("REN_CREATE_DIRS", "true"),
         ]);
-        let mut cli = Cli::parse_from(["ren", "foo", "bar"]);
-        cli.apply_env_defaults_with(|k| env.get(k).map(|s| (*s).to_owned()));
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
         assert!(cli.hidden);
         assert!(cli.no_ignore);
         assert!(cli.recursive);
         assert!(cli.include_dirs);
         assert!(cli.include_extension);
-        assert!(cli.only_extension);
+        // `include_extension` and `only_extension` are mutex: setting both via
+        // env would error. This run sets only `include_extension`; the dedicated
+        // mutex test covers the opposite.
+        assert!(!cli.only_extension);
         assert!(cli.smart);
         assert!(cli.ignore_case);
         assert!(cli.greedy);
         assert!(cli.regexp);
+        assert!(cli.word_regexp);
         assert!(cli.preview);
+        assert!(cli.dry_run);
+        assert!(cli.create_dirs);
+    }
+
+    #[test]
+    fn test_env_only_extension_branch_of_mutex_group() {
+        // Counterpart of `test_env_defaults_enable_boolean_flags`, which
+        // exercises the `include_extension` side of the same mutex pair.
+        let _g = EnvGuard::set(&[("REN_ONLY_EXTENSION", "1")]);
+        let cli = resolve_with_origin(&["ren", "rs", "txt"], &config::Origin::default()).unwrap();
+        assert!(cli.only_extension);
+        assert!(!cli.include_extension);
+    }
+
+    #[test]
+    fn test_env_prepend_and_append_string_values() {
+        let _g = EnvGuard::set(&[("REN_PREPEND", "{N}_"), ("REN_APPEND", "-{n}")]);
+        let cli = resolve_with_origin(&["ren"], &config::Origin::default()).unwrap();
+        assert_eq!(cli.prepend.as_deref(), Some("{N}_"));
+        assert_eq!(cli.append.as_deref(), Some("-{n}"));
+    }
+
+    #[test]
+    fn test_env_empty_string_for_optional_strings_is_unset() {
+        // `Option<String>` env vars must collapse `Some("")` to `None`, else
+        // `uses_transforms()` flips ren into transforms-only mode and the next
+        // positional gets misparsed as a path. Pin the behavior here.
+        let _g = EnvGuard::set(&[("REN_PREPEND", ""), ("REN_APPEND", "")]);
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        assert!(cli.prepend.is_none());
+        assert!(cli.append.is_none());
+        assert!(!cli.uses_transforms());
     }
 
     #[test]
     fn test_env_defaults_falsy_values_are_ignored() {
-        let env = std::collections::HashMap::from([
+        // `BoolishValueParser` accepts "0"/"false" (case-insensitive) as
+        // falsy. Setting these via env is equivalent to leaving the flag
+        // unset on the CLI - the boolean stays `false`.
+        let _g = EnvGuard::set(&[
             ("REN_HIDDEN", "0"),
             ("REN_RECURSIVE", "false"),
-            ("REN_INCLUDE_DIRS", ""),
+            ("REN_INCLUDE_DIRS", "FALSE"),
             ("REN_SMART", "false"),
         ]);
-        let mut cli = Cli::parse_from(["ren", "foo", "bar"]);
-        cli.apply_env_defaults_with(|k| env.get(k).map(|s| (*s).to_owned()));
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
         assert!(!cli.hidden);
         assert!(!cli.recursive);
         assert!(!cli.include_dirs);
@@ -1131,13 +1424,30 @@ mod tests {
     }
 
     #[test]
+    fn test_env_empty_string_for_bool_is_rejected() {
+        // `BoolishValueParser` only accepts truthy/falsy tokens; an empty
+        // string is neither and parses fail. This catches typos in `.env`
+        // files where a variable is mentioned without a value.
+        let _g = EnvGuard::set(&[("REN_INCLUDE_DIRS", "")]);
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default())
+            .err()
+            .expect("empty bool should fail to parse");
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("include-dirs"),
+            "error should name the offending flag, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_env_preview_composes_with_dry_run_flag() {
         // `--preview` and `--dry-run` compose: REN_PREVIEW=1 with `-n` on the
         // CLI ends up with both flags set. The runtime body uses preview to
         // collect the accepted set, then prints (rather than applies) the plan.
-        let env = std::collections::HashMap::from([("REN_PREVIEW", "1")]);
-        let mut cli = Cli::parse_from(["ren", "-n", "foo", "bar"]);
-        cli.apply_env_defaults_with(|k| env.get(k).map(|s| (*s).to_owned()));
+        let _g = EnvGuard::set(&[("REN_PREVIEW", "1")]);
+        let cli =
+            resolve_with_origin(&["ren", "-n", "foo", "bar"], &config::Origin::default()).unwrap();
         assert!(cli.preview);
         assert!(cli.dry_run);
     }
@@ -1146,19 +1456,171 @@ mod tests {
     fn test_preview_and_dry_run_compose() {
         // `--preview --dry-run` is a legitimate user story: walk the prompts,
         // accept/reject entries, then print the plan instead of touching the
-        // filesystem. Dropping `conflicts_with = "preview"` from the `dry_run`
-        // clap attribute is what makes this parse.
-        let cli = Cli::try_parse_from(["ren", "--preview", "--dry-run", "foo", "bar"]).unwrap();
+        // filesystem. The two flags have no `conflicts_with` relationship,
+        // so clap accepts both on the same command line.
+        let cli = parse_and_resolve(&["ren", "--preview", "--dry-run", "foo", "bar"]).unwrap();
         assert!(cli.preview);
         assert!(cli.dry_run);
     }
 
+    // ---- mutex resolver --------------------------------------------------
+
+    #[test]
+    fn test_lower_and_upper_are_mutex_on_cli() {
+        let err = parse_and_resolve(&["ren", "--lower", "--upper", "foo", "bar"])
+            .err()
+            .expect("CLI lower/upper conflict expected");
+        assert!(
+            err.to_string().contains("--lower") && err.to_string().contains("--upper"),
+            "expected CLI mutex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_include_and_only_extension_are_mutex_on_cli() {
+        let err = parse_and_resolve(&[
+            "ren",
+            "--include-extension",
+            "--only-extension",
+            "foo",
+            "bar",
+        ])
+        .err()
+        .expect("CLI ext conflict expected");
+        assert!(
+            err.to_string().contains("--include-extension")
+                && err.to_string().contains("--only-extension"),
+            "expected CLI mutex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_lower_beats_shell_env_upper() {
+        let _g = EnvGuard::set(&[("REN_UPPER", "true")]);
+        let cli = resolve_with_origin(
+            &["ren", "--lower", "foo", "bar"],
+            &config::Origin::default(),
+        )
+        .unwrap();
+        assert!(cli.lower);
+        assert!(!cli.upper);
+    }
+
+    #[test]
+    fn test_shell_env_beats_config_in_mutex_group() {
+        // Config sets lower=true (synthesized REN_LOWER), shell sets
+        // REN_UPPER=true. Shell wins over config.
+        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let origin = fake_config_origin(&["REN_LOWER"]);
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &origin).unwrap();
+        assert!(
+            cli.upper,
+            "shell REN_UPPER must beat config-derived REN_LOWER"
+        );
+        assert!(!cli.lower);
+    }
+
+    #[test]
+    fn test_two_shell_env_vars_in_one_group_errors() {
+        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default())
+            .err()
+            .expect("expected resolver error")
+            .to_string();
+        assert!(
+            err.contains("environment variables"),
+            "expected env-conflict wording, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_two_config_keys_in_one_group_errors() {
+        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let origin = fake_config_origin(&["REN_LOWER", "REN_UPPER"]);
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &origin)
+            .err()
+            .expect("expected resolver error")
+            .to_string();
+        assert!(
+            err.contains("config sets"),
+            "expected config-conflict wording, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_only_extension_beats_shell_env_include_extension() {
+        let _g = EnvGuard::set(&[("REN_INCLUDE_EXTENSION", "true")]);
+        let cli = resolve_with_origin(
+            &["ren", "--only-extension", "rs", "txt"],
+            &config::Origin::default(),
+        )
+        .unwrap();
+        assert!(cli.only_extension);
+        assert!(!cli.include_extension);
+    }
+
+    #[test]
+    fn test_shell_env_beats_config_in_extension_group() {
+        // Config sets include-extension; shell sets REN_ONLY_EXTENSION. Shell
+        // wins. Same precedence as lower/upper, this just pins the second
+        // mutex group's wiring.
+        let _g = EnvGuard::set(&[
+            ("REN_INCLUDE_EXTENSION", "true"),
+            ("REN_ONLY_EXTENSION", "true"),
+        ]);
+        let origin = fake_config_origin(&["REN_INCLUDE_EXTENSION"]);
+        let cli = resolve_with_origin(&["ren", "rs", "txt"], &origin).unwrap();
+        assert!(
+            cli.only_extension,
+            "shell REN_ONLY_EXTENSION must beat config-derived REN_INCLUDE_EXTENSION"
+        );
+        assert!(!cli.include_extension);
+    }
+
+    #[test]
+    fn test_two_shell_env_vars_in_extension_group_errors() {
+        let _g = EnvGuard::set(&[
+            ("REN_INCLUDE_EXTENSION", "true"),
+            ("REN_ONLY_EXTENSION", "true"),
+        ]);
+        let err = resolve_with_origin(&["ren", "rs", "txt"], &config::Origin::default())
+            .err()
+            .expect("expected resolver error")
+            .to_string();
+        assert!(
+            err.contains("environment variables"),
+            "expected env-conflict wording, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_arg_env_name_matches_clap_spec() {
+        // The hardcoded `arg_env_name` map mirrors the `env = ...` attributes
+        // on the `Cli` struct. If a new env-backed flag is added without
+        // updating the map, source-aware resolution and config-tier error
+        // wording will silently misclassify it.
+        let _lock = lock_for_parse();
+        let cmd = Cli::command();
+        for arg in cmd.get_arguments() {
+            if let Some(declared) = arg.get_env() {
+                let id = arg.get_id().as_str();
+                let mapped = arg_env_name(id);
+                assert_eq!(
+                    mapped,
+                    Some(declared.to_str().expect("env name is UTF-8")),
+                    "arg_env_name({id}) does not match clap's env attribute",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cli_flag_wins_over_env_for_booleans() {
-        // Explicit `-R` already true - env can't unset it (env is OR-only).
-        let env = std::collections::HashMap::from([("REN_RECURSIVE", "0")]);
-        let mut cli = Cli::parse_from(["ren", "-R", "foo", "bar"]);
-        cli.apply_env_defaults_with(|k| env.get(k).map(|s| (*s).to_owned()));
+        // Explicit `-R` set on CLI beats `REN_RECURSIVE=0` from env (clap's
+        // ValueSource::CommandLine wins over ValueSource::EnvVariable).
+        let _g = EnvGuard::set(&[("REN_RECURSIVE", "0")]);
+        let cli =
+            resolve_with_origin(&["ren", "-R", "foo", "bar"], &config::Origin::default()).unwrap();
         assert!(cli.recursive);
     }
 
