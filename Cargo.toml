@@ -15,10 +15,16 @@ crossterm = "0.29"
 ignore = "0.4"
 Inflector = "0.11"
 natord = "1.0"
-num-format = { version = "0.4", features = ["with-system-locale"] }
+num-format = "0.4"
 regex = "1.5"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+# `with-system-locale` pulls in num-format-windows, whose build script needs the
+# Windows SDK and so can't be cross-compiled. Enable it off-Windows only; on
+# Windows `with_commas` falls back to the static English locale.
+[target.'cfg(not(windows))'.dependencies]
+num-format = { version = "0.4", features = ["with-system-locale"] }
 
 [dev-dependencies]
 assert_cmd = "2"

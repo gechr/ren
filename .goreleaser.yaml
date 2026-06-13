@@ -42,4 +42,4 @@ scoops:
     directory: bucket
     homepage: https://github.com/gechr/ren
     description: Batch file renamer
-    license: MIT
+    license: Apache-2.0
