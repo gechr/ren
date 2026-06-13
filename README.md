@@ -8,11 +8,20 @@ Where `rep` rewrites file *contents*, `ren` rewrites file *names*. Plain and reg
 
 ## Install
 
+### macOS
+
 ```shell
 brew install gechr/tap/ren
 ```
 
-Or with Cargo:
+### Windows
+
+```shell
+scoop bucket add gechr https://github.com/gechr/scoop-bucket
+scoop install gechr/ren
+```
+
+### Cargo
 
 ```shell
 cargo install --git https://github.com/gechr/ren
