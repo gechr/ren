@@ -8,7 +8,7 @@ Where `rep` rewrites file *contents*, `ren` rewrites file *names*. Plain and reg
 
 ## Install
 
-### macOS
+### macOS / Linux
 
 ```shell
 brew install gechr/tap/ren
