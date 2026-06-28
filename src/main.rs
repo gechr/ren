@@ -780,43 +780,333 @@ fn diff_chars(old: &str, new: &str) -> Vec<DiffOp> {
     ops
 }
 
-fn render_diff_side(ops: &[DiffOp], old_side: bool, color: &str) -> String {
-    let mut rendered = String::new();
+/// Which side of the rename a span is being rendered for. `Old` is the
+/// red/removed side, `New` the green/added side.
+#[derive(Clone, Copy)]
+enum Side {
+    Old,
+    New,
+}
+
+impl Side {
+    /// ANSI color used to highlight changed content on this side.
+    const fn color(self) -> &'static str {
+        match self {
+            Self::Old => "\x1b[31m",
+            Self::New => "\x1b[32m",
+        }
+    }
+}
+
+/// A token-level diff item. `Both` is an unchanged token (identical text on
+/// both sides); `Left`/`Right` are tokens present only on the old/new side.
+#[derive(Clone, Copy)]
+enum TokenDiff<'a> {
+    Both(&'a str),
+    Left(&'a str),
+    Right(&'a str),
+}
+
+/// Render one side of the `old → new` rename line.
+///
+/// The diff is *token-driven* (see `tokenize`), and character-level
+/// highlighting is only used when a change forms a single contiguous run per
+/// side - otherwise the whole token/block is highlighted. This mirrors `rep`'s
+/// diff: wholesale renames (e.g. `--supplant`) collapse to one solid
+/// red-blob → green-blob rather than scattering color across coincidentally
+/// shared characters.
+fn render_inline_side(old_line: &str, new_line: &str, side: Side) -> String {
+    let old_tokens = tokenize(old_line);
+    let new_tokens = tokenize(new_line);
+    let diffs = diff_tokens(&old_tokens, &new_tokens);
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < diffs.len() {
+        match diffs[i] {
+            TokenDiff::Both(tok) => {
+                out.push_str(tok);
+                i += 1;
+            }
+            TokenDiff::Left(_) | TokenDiff::Right(_) => {
+                // Gather the whole consecutive run of changed tokens so the
+                // block can be classified (balanced replace vs lopsided
+                // insert/delete) as a unit.
+                let mut lefts: Vec<&str> = Vec::new();
+                let mut rights: Vec<&str> = Vec::new();
+                while i < diffs.len() {
+                    match diffs[i] {
+                        TokenDiff::Left(t) => {
+                            lefts.push(t);
+                            i += 1;
+                        }
+                        TokenDiff::Right(t) => {
+                            rights.push(t);
+                            i += 1;
+                        }
+                        TokenDiff::Both(..) => break,
+                    }
+                }
+                write_change_block(&mut out, &lefts, &rights, side);
+            }
+        }
+    }
+    out
+}
+
+/// Render a block of changed tokens for one side.
+fn write_change_block(out: &mut String, lefts: &[&str], rights: &[&str], side: Side) {
+    // Equal token counts: treat as positionally-paired replacements, each of
+    // which may char-diff if it's a single-run word edit.
+    if lefts.len() == rights.len() {
+        for (left, right) in lefts.iter().zip(rights) {
+            if should_intra_word_diff(left, right) {
+                write_char_diff(out, left, right, side);
+            } else {
+                write_highlighted(
+                    out,
+                    if matches!(side, Side::Old) {
+                        left
+                    } else {
+                        right
+                    },
+                    side,
+                );
+            }
+        }
+        return;
+    }
+
+    // Lopsided block (insert/delete heavy). Char-diff only if the concatenated
+    // texts form a single changed run per side; otherwise highlight the whole
+    // side's tokens as one solid block.
+    let old_text = lefts.concat();
+    let new_text = rights.concat();
+    if should_block_char_diff(&old_text, &new_text) {
+        write_char_diff(out, &old_text, &new_text, side);
+        return;
+    }
+    for tok in if matches!(side, Side::Old) {
+        lefts
+    } else {
+        rights
+    } {
+        write_highlighted(out, tok, side);
+    }
+}
+
+/// Push `text` wrapped in this side's highlight color.
+fn write_highlighted(out: &mut String, text: &str, side: Side) {
+    out.push_str(side.color());
+    out.push_str(text);
+    out.push_str("\x1b[m");
+}
+
+/// Character-level highlight of `old`→`new` for one side, coloring only the
+/// changed characters (shared characters are emitted plain).
+fn write_char_diff(out: &mut String, old: &str, new: &str, side: Side) {
+    let color = side.color();
     let mut colored = false;
-
-    for op in ops {
-        let (ch, changed) = match (*op, old_side) {
+    for op in diff_chars(old, new) {
+        let (ch, changed) = match (op, side) {
             (DiffOp::Same(ch), _) => (Some(ch), false),
-            (DiffOp::Old(ch), true) | (DiffOp::New(ch), false) => (Some(ch), true),
-            (DiffOp::Old(_), false) | (DiffOp::New(_), true) => (None, false),
+            (DiffOp::Old(ch), Side::Old) | (DiffOp::New(ch), Side::New) => (Some(ch), true),
+            _ => (None, false),
         };
-
-        let Some(ch) = ch else {
-            continue;
-        };
-
+        let Some(ch) = ch else { continue };
         if changed && !colored {
-            rendered.push_str(color);
+            out.push_str(color);
             colored = true;
         } else if !changed && colored {
-            rendered.push_str("\x1b[m");
+            out.push_str("\x1b[m");
             colored = false;
         }
-        rendered.push(ch);
+        out.push(ch);
     }
-
     if colored {
-        rendered.push_str("\x1b[m");
+        out.push_str("\x1b[m");
+    }
+}
+
+/// True when a lopsided block should still char-diff: both sides within the
+/// length cap and the change forms a single contiguous run per side.
+fn should_block_char_diff(old: &str, new: &str) -> bool {
+    const MAX_BLOCK_CHAR_DIFF_LEN: usize = 1024;
+    if old.len() > MAX_BLOCK_CHAR_DIFF_LEN || new.len() > MAX_BLOCK_CHAR_DIFF_LEN {
+        return false;
+    }
+    has_single_changed_run_per_side(old, new)
+}
+
+/// True when a balanced word-pair should char-diff rather than be highlighted
+/// wholesale: both tokens are words within the cap and the edit is a single
+/// contiguous run per side (so colored chars are never broken up by shared
+/// ones - the anti-speckle guard).
+fn should_intra_word_diff(old_tok: &str, new_tok: &str) -> bool {
+    const MAX_INTRA_WORD_LEN: usize = 1024;
+    if token_kind(old_tok) != TokenKind::Word || token_kind(new_tok) != TokenKind::Word {
+        return false;
+    }
+    if old_tok.len() > MAX_INTRA_WORD_LEN || new_tok.len() > MAX_INTRA_WORD_LEN {
+        return false;
+    }
+    has_single_changed_run_per_side(old_tok, new_tok)
+}
+
+/// True when each side of the char diff has at most one contiguous changed run.
+fn has_single_changed_run_per_side(old: &str, new: &str) -> bool {
+    let mut left_runs = 0usize;
+    let mut right_runs = 0usize;
+    let mut in_left = false;
+    let mut in_right = false;
+    for op in diff_chars(old, new) {
+        match op {
+            DiffOp::Old(_) => {
+                if !in_left {
+                    left_runs += 1;
+                    in_left = true;
+                }
+                in_right = false;
+            }
+            DiffOp::New(_) => {
+                if !in_right {
+                    right_runs += 1;
+                    in_right = true;
+                }
+                in_left = false;
+            }
+            DiffOp::Same(_) => {
+                in_left = false;
+                in_right = false;
+            }
+        }
+        if left_runs > 1 || right_runs > 1 {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Whitespace,
+    Word,
+    Symbol,
+}
+
+fn classify(c: char) -> TokenKind {
+    if c.is_whitespace() {
+        TokenKind::Whitespace
+    } else if c.is_alphanumeric() {
+        TokenKind::Word
+    } else {
+        TokenKind::Symbol
+    }
+}
+
+fn token_kind(tok: &str) -> TokenKind {
+    tok.chars().next().map_or(TokenKind::Symbol, classify)
+}
+
+/// Split a name into whitespace runs, single symbols, and words (words further
+/// split at sub-word boundaries like `camelCase`/`word2`), so the diff aligns
+/// on meaningful units instead of individual characters.
+fn tokenize(line: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut iter = line.char_indices().peekable();
+    while let Some((start, c)) = iter.next() {
+        match classify(c) {
+            TokenKind::Symbol => {
+                let end = iter.peek().map_or(line.len(), |&(i, _)| i);
+                tokens.push(&line[start..end]);
+            }
+            TokenKind::Whitespace => {
+                let mut end = line.len();
+                while let Some(&(i, next)) = iter.peek() {
+                    if classify(next) != TokenKind::Whitespace {
+                        end = i;
+                        break;
+                    }
+                    iter.next();
+                }
+                tokens.push(&line[start..end]);
+            }
+            TokenKind::Word => {
+                let mut sub_start = start;
+                let mut prev = c;
+                while let Some(&(i, cur)) = iter.peek() {
+                    if classify(cur) != TokenKind::Word {
+                        break;
+                    }
+                    iter.next();
+                    let next = iter.peek().map(|&(_, n)| n);
+                    if is_subword_boundary(prev, cur, next) {
+                        tokens.push(&line[sub_start..i]);
+                        sub_start = i;
+                    }
+                    prev = cur;
+                }
+                let end = iter.peek().map_or(line.len(), |&(i, _)| i);
+                tokens.push(&line[sub_start..end]);
+            }
+        }
+    }
+    tokens
+}
+
+fn is_subword_boundary(prev: char, cur: char, next: Option<char>) -> bool {
+    if prev.is_alphabetic() != cur.is_alphabetic() {
+        return true;
+    }
+    if prev.is_lowercase() && cur.is_uppercase() {
+        return true;
+    }
+    prev.is_uppercase() && cur.is_uppercase() && matches!(next, Some(n) if n.is_lowercase())
+}
+
+/// Token-level LCS diff. Mirrors `diff_chars`' DP but over `&str` tokens.
+fn diff_tokens<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<TokenDiff<'a>> {
+    let mut dp = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            dp[i][j] = if old[i] == new[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
     }
 
-    rendered
+    let mut ops = Vec::with_capacity(old.len().max(new.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            ops.push(TokenDiff::Both(old[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(TokenDiff::Left(old[i]));
+            i += 1;
+        } else {
+            ops.push(TokenDiff::Right(new[j]));
+            j += 1;
+        }
+    }
+    while i < old.len() {
+        ops.push(TokenDiff::Left(old[i]));
+        i += 1;
+    }
+    while j < new.len() {
+        ops.push(TokenDiff::Right(new[j]));
+        j += 1;
+    }
+    ops
 }
 
 fn colorized_rename_line(old: &str, new: &str) -> String {
-    let ops = diff_chars(old, new);
-    let old = render_diff_side(&ops, true, "\x1b[31m");
-    let new = render_diff_side(&ops, false, "\x1b[32m");
-    format!("{old} \x1b[2m→\x1b[m {new}",)
+    let old_side = render_inline_side(old, new, Side::Old);
+    let new_side = render_inline_side(old, new, Side::New);
+    format!("{old_side} \x1b[2m→\x1b[m {new_side}")
 }
 
 /// Translate a `Cli` into the decoupled `CompileOptions` consumed by
@@ -1279,11 +1569,33 @@ mod tests {
     }
 
     #[test]
-    fn test_colorized_rename_line_handles_multiple_regex_replacements() {
+    fn test_colorized_rename_line_highlights_whole_word_on_multi_run_edit() {
+        // `Cargo` → `Cbrgb` has two separate changed chars (a→b, o→b): rather
+        // than speckle them, the whole word is highlighted. `lock` → `lbck` is
+        // a single run, so it still char-diffs to just the `o`/`b`.
         assert_eq!(
             colorized_rename_line("Cargo.lock", "Cbrgb.lbck"),
-            "C\x1b[31ma\x1b[mrg\x1b[31mo\x1b[m.l\x1b[31mo\x1b[mck \x1b[2m→\x1b[m C\x1b[32mb\x1b[mrg\x1b[32mb\x1b[m.l\x1b[32mb\x1b[mck"
+            "\x1b[31mCargo\x1b[m.l\x1b[31mo\x1b[mck \x1b[2m→\x1b[m \x1b[32mCbrgb\x1b[m.l\x1b[32mb\x1b[mck"
         );
+    }
+
+    #[test]
+    fn test_colorized_rename_line_wholesale_replacement_not_speckled() {
+        // The `--supplant` case: the stem is replaced outright. The shared
+        // `.jpg` extension stays plain, and the stem is a single solid
+        // red → green block - no per-character confetti from coincidentally
+        // shared digits/letters.
+        assert_eq!(
+            colorized_rename_line("photo.jpg", "01.jpg"),
+            "\x1b[31mphoto\x1b[m.jpg \x1b[2m→\x1b[m \x1b[32m01\x1b[m.jpg"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_splits_on_subword_boundaries() {
+        assert_eq!(tokenize("WhatsApp"), vec!["Whats", "App"]);
+        assert_eq!(tokenize("img2"), vec!["img", "2"]);
+        assert_eq!(tokenize("a-b.c"), vec!["a", "-", "b", ".", "c"]);
     }
 
     // ---- is_regex ---------------------------------------------------------
