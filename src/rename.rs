@@ -144,6 +144,7 @@ pub(crate) fn build_plan(
     exprs: &[expressions::CompiledExpression],
     scope: ExtensionScope,
     transforms_opts: &transforms::TransformOptions,
+    target_dir: Option<&Path>,
 ) -> Vec<PlanEntry> {
     let mut plan = Vec::with_capacity(records.len());
     let mut dir_counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
@@ -236,6 +237,14 @@ pub(crate) fn build_plan(
             .parent()
             .map(|p| p.join(&new_basename))
             .unwrap_or_else(|| PathBuf::from(&new_basename));
+
+        // `-d <dir>` relocates the whole computed target under <dir>:
+        // `foo/bar` + `a/b/c` => `foo/bar/a/b/c`. `Path::join` normalizes a
+        // trailing slash, so `a/b` and `a/b/` behave identically.
+        let new = match target_dir {
+            Some(dir) => dir.join(&new),
+            None => new,
+        };
 
         let depth = record
             .path
@@ -535,6 +544,7 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert_eq!(plan.len(), 1);
         validate_plan(&plan).unwrap();
@@ -765,6 +775,7 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert!(plan.is_empty());
 
@@ -789,11 +800,54 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
+            None,
         );
 
         assert_eq!(plan.len(), 1);
         // a/b/c.txt under tmp/ → depth 3 relative to root.
         assert_eq!(plan[0].depth, 3);
+    }
+
+    // ---- target directory (`-d`) -----------------------------------------
+
+    #[test]
+    fn build_plan_target_dir_relocates_under_base() {
+        // `build_plan` is pure path/string manipulation (no fs access), so
+        // synthetic relative paths exercise the relocation directly.
+        let records = vec![record(PathBuf::from("a/b/c.txt"), PathBuf::from("."))];
+        let exprs = compile("c", "z");
+        let plan = build_plan(
+            &records,
+            &exprs,
+            ExtensionScope::Exclude,
+            &transforms::TransformOptions::default(),
+            Some(Path::new("foo/bar")),
+        );
+
+        assert_eq!(plan.len(), 1);
+        // foo/bar + a/b/z.txt => foo/bar/a/b/z.txt
+        assert_eq!(plan[0].new, PathBuf::from("foo/bar/a/b/z.txt"));
+        // The source is untouched by `-d`.
+        assert_eq!(plan[0].old, PathBuf::from("a/b/c.txt"));
+    }
+
+    #[test]
+    fn build_plan_target_dir_trailing_slash_is_equivalent() {
+        let records = vec![record(PathBuf::from("a/b/c.txt"), PathBuf::from("."))];
+        let exprs = compile("c", "z");
+        let with = |dir| {
+            build_plan(
+                &records,
+                &exprs,
+                ExtensionScope::Exclude,
+                &transforms::TransformOptions::default(),
+                Some(Path::new(dir)),
+            )[0]
+            .new
+            .clone()
+        };
+
+        assert_eq!(with("foo/bar"), with("foo/bar/"));
     }
 
     // ---- counter ----------------------------------------------------------
@@ -813,7 +867,7 @@ mod tests {
             prepend: Some("{n:02}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01_a.txt"));
         assert_eq!(plan[1].new, tmp.path().join("02_b.txt"));
@@ -835,7 +889,7 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("b-2.txt"));
@@ -855,7 +909,7 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01.jpg"));
         assert_eq!(plan[1].new, tmp.path().join("02.jpg"));
@@ -875,7 +929,7 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01"));
         assert_eq!(plan[1].new, tmp.path().join("02"));
@@ -896,7 +950,7 @@ mod tests {
             supplant: Some("same".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
 
         // Both collapse to `same.txt`.
         assert_eq!(plan[0].new, tmp.path().join("same.txt"));
@@ -921,7 +975,7 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("001_file-0.txt"));
         assert_eq!(plan[98].new, tmp.path().join("099_file-98.txt"));
@@ -945,7 +999,7 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
 
         assert_eq!(plan[0].new, small.join("01_only.txt"));
         assert_eq!(plan[1].new, large.join("001_file-0.txt"));
@@ -965,7 +1019,7 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("1-a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("2-b-2.txt"));
@@ -1026,6 +1080,7 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, txt_named);
@@ -1037,6 +1092,7 @@ mod tests {
             &exprs,
             ExtensionScope::Include,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert_eq!(plan_full.len(), 2);
     }
@@ -1068,6 +1124,7 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, archive);
@@ -1089,6 +1146,7 @@ mod tests {
             &exprs,
             ExtensionScope::Exclude,
             &transforms::TransformOptions::default(),
+            None,
         );
 
         assert_eq!(plan.len(), 1);
@@ -1118,6 +1176,7 @@ mod tests {
             &exprs,
             ExtensionScope::Only,
             &transforms::TransformOptions::default(),
+            None,
         );
 
         assert_eq!(plan.len(), 2);
@@ -1145,6 +1204,7 @@ mod tests {
             &exprs,
             ExtensionScope::Only,
             &transforms::TransformOptions::default(),
+            None,
         );
         assert!(plan.is_empty());
     }

@@ -69,7 +69,7 @@ struct Cli {
 
     /// Admit directories into the rename plan
     #[arg(
-        short = 'd',
+        short = 'D',
         long = "include-dirs",
         env = "REN_INCLUDE_DIRS",
         value_parser = BoolishValueParser::new()
@@ -247,6 +247,21 @@ struct Cli {
     )]
     create_dirs: bool,
 
+    /// Relocate renamed files under this base directory.
+    ///
+    /// The computed target path is joined onto `<dir>`, so a rename producing
+    /// `a/b/c` with `-d foo/bar` lands at `foo/bar/a/b/c`. A trailing slash is
+    /// immaterial (`-d a/b` and `-d a/b/` behave identically). Missing parent
+    /// directories are created automatically (implies `--create-dirs`).
+    #[arg(
+        short = 'd',
+        long = "directory",
+        alias = "dir",
+        value_name = "DIR",
+        env = "REN_DIRECTORY"
+    )]
+    directory: Option<PathBuf>,
+
     #[arg(long = "completions", value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
 }
@@ -302,7 +317,7 @@ fn print_help() {
 {yellow}{bold}Scope{reset}
 
   {red}-R{reset}, {red}--recursive{reset}           Recurse into subdirectories
-  {red}-d{reset}, {red}--include-dirs{reset}        Also rename directories
+  {red}-D{reset}, {red}--include-dirs{reset}        Also rename directories
   {red}-x{reset}, {red}--include-extension{reset}   Include extension in matching and replacement
   {red}-X{reset}, {red}--only-extension{reset}      Match the file extension only
 
@@ -315,11 +330,14 @@ fn print_help() {
   {red}-A{reset}, {red}--append {dim}<fmt>{reset}        Append a string or template
   {red}-s{reset}, {red}--supplant {dim}<fmt>{reset}      Replace names with a string or template
 
-{yellow}{bold}Behavior{reset}
+{yellow}{bold}Output{reset}
 
+  {red}-d{reset}, {red}--directory {dim}<dir>{reset}     Relocate renamed files under {red}<dir>{reset} {grey}(implies --create-dirs){reset}
       {red}--create-dirs{reset}         Create missing parent directories
 
-  {red}-l{reset}, {red}--list-files{reset}          Print matching file paths (no rename)
+{yellow}{bold}Behavior{reset}
+
+  {red}-l{reset}, {red}--list-files{reset}          Print matching file paths {grey}(no rename){reset}
 
   {red}-n{reset}, {red}--dry-run{reset}             Show what would be changed without renaming {grey}(default){reset}
   {red}-W{reset}, {red}--write{reset}               Apply renames to disk
@@ -405,6 +423,10 @@ fn print_help_long() {
 
   {grey}# Move into new subdirectories, creating parents as needed{reset}
   {green}${reset} ren --create-dirs --regex '^(.*)\\.log$' 'logs/$1.log'
+
+  {grey}# Relocate matches under a base directory, creating parents as needed{reset}
+  {grey}#  (a/b/c.txt → out/a/b/c.txt; -d implies --create-dirs){reset}
+  {green}${reset} ren -R -d out foo bar
 
   {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart per-dir width){reset}
   {green}${reset} ren --prepend '{{N}}_'
@@ -699,6 +721,7 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
         "write" => "REN_WRITE",
         "preview" => "REN_PREVIEW",
         "create_dirs" => "REN_CREATE_DIRS",
+        "directory" => "REN_DIRECTORY",
         _ => return None,
     })
 }
@@ -1438,12 +1461,22 @@ fn run() -> Result<()> {
     } else {
         ExtensionScope::Exclude
     };
-    let plan = build_plan(&records, &exprs, scope, &transforms_opts);
+    let plan = build_plan(
+        &records,
+        &exprs,
+        scope,
+        &transforms_opts,
+        cli.directory.as_deref(),
+    );
     validate_plan(&plan)?;
 
     if plan.is_empty() {
         return Ok(());
     }
+
+    // Relocating into a target directory (`-d`) almost always points at a
+    // not-yet-existing tree, so it implies `--create-dirs`.
+    let create_dirs = cli.create_dirs || cli.directory.is_some();
 
     if cli.preview {
         let mut patcher = preview::PreviewPatcher::new();
@@ -1451,7 +1484,7 @@ fn run() -> Result<()> {
         if accepted.is_empty() {
             return Ok(());
         }
-        if cli.create_dirs {
+        if create_dirs {
             create_missing_parents(&accepted)?;
         }
         apply_plan(&accepted)?;
@@ -1464,7 +1497,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if cli.create_dirs {
+    if create_dirs {
         create_missing_parents(&plan)?;
     }
     apply_plan(&plan)?;
@@ -1780,6 +1813,34 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_flag_parses_short_long_and_alias() {
+        for argv in [
+            ["ren", "-d", "foo/bar"],
+            ["ren", "--directory", "foo/bar"],
+            ["ren", "--dir", "foo/bar"],
+        ] {
+            let cli = parse_cli(&argv);
+            assert_eq!(
+                cli.directory.as_deref(),
+                Some(std::path::Path::new("foo/bar"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_short_flag_freed_from_include_dirs() {
+        // `-d` now selects `--directory`, not `--include-dirs` (which moved to
+        // `-D`). Pin both halves of the rebind.
+        let cli = parse_cli(&["ren", "-d", "out", "a", "b"]);
+        assert_eq!(cli.directory.as_deref(), Some(std::path::Path::new("out")));
+        assert!(!cli.include_dirs);
+
+        let cli = parse_cli(&["ren", "-D", "a", "b"]);
+        assert!(cli.include_dirs);
+        assert!(cli.directory.is_none());
+    }
+
+    #[test]
     fn test_expression_mode_without_paths_defaults_to_current_dir() {
         let cli = parse_cli(&["ren", "-e", "a", "b", "-e", "b", "c", "--dry-run"]);
         assert!(cli.paths().is_empty());
@@ -1842,6 +1903,16 @@ mod tests {
         let cli = resolve_with_origin(&["ren"], &config::Origin::default()).unwrap();
         assert_eq!(cli.prepend.as_deref(), Some("{N}_"));
         assert_eq!(cli.append.as_deref(), Some("-{n}"));
+    }
+
+    #[test]
+    fn test_env_directory_string_value() {
+        let _g = EnvGuard::set(&[("REN_DIRECTORY", "foo/bar")]);
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        assert_eq!(
+            cli.directory.as_deref(),
+            Some(std::path::Path::new("foo/bar"))
+        );
     }
 
     #[test]
@@ -2099,7 +2170,7 @@ mod tests {
 
     #[test]
     fn test_compile_options_literal_find_replace() {
-        let cli = Cli::parse_from(["ren", "foo", "bar"]);
+        let cli = parse_cli(&["ren", "foo", "bar"]);
         let opts = compile_options_from_cli(&cli);
         assert_eq!(opts.positional_find.as_deref(), Some("foo"));
         assert_eq!(opts.positional_replace.as_deref(), Some("bar"));
@@ -2122,7 +2193,7 @@ mod tests {
     fn test_compile_options_list_files_find_only() {
         // `-l TODO` with no `-e`: only `<find>` is provided. Compile options
         // should mark this as find-only with no replacement.
-        let cli = Cli::parse_from(["ren", "-l", "TODO"]);
+        let cli = parse_cli(&["ren", "-l", "TODO"]);
         let opts = compile_options_from_cli(&cli);
         assert!(opts.list_files_find_only);
         assert_eq!(opts.positional_find.as_deref(), Some("TODO"));
@@ -2139,7 +2210,7 @@ mod tests {
 
     #[test]
     fn test_compile_options_carries_regex_flags() {
-        let cli = Cli::parse_from(["ren", "-r", "-i", "-G", "-w", "foo", "bar"]);
+        let cli = parse_cli(&["ren", "-r", "-i", "-G", "-w", "foo", "bar"]);
         let opts = compile_options_from_cli(&cli);
         assert!(opts.regex);
         assert!(opts.ignore_case);

@@ -448,6 +448,39 @@ fn missing_parent_without_create_dirs_fails_and_rolls_back() {
 }
 
 #[test]
+fn directory_relocates_matches_preserving_subtree() {
+    // `a/b/foo.txt` renamed with `-d out` lands at `out/a/b/bar.txt`, and the
+    // intermediate `out/a/b` tree is created automatically (no `--create-dirs`).
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("a/b")).unwrap();
+    fs::write(dir.path().join("a/b/foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "-R", "-d", "out", "foo", "bar"])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("out/a/b/bar.txt").exists());
+    assert!(!dir.path().join("a/b/foo.txt").exists());
+}
+
+#[test]
+fn directory_short_flag_no_longer_means_include_dirs() {
+    // `-d` selects `--directory`; `--include-dirs` moved to `-D`. A bare `-d`
+    // with a directory value must not toggle directory admission.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("foodir")).unwrap();
+    fs::write(dir.path().join("foodir/inner.txt"), "").unwrap();
+
+    // `-D` admits directories into the plan and renames `foodir` → `bardir`.
+    ren(&dir)
+        .args(["-W", "-D", "foo", "bar"])
+        .assert()
+        .success();
+    assert!(dir.path().join("bardir").is_dir());
+}
+
+#[test]
 fn null_with_explicit_paths_errors() {
     // `-0` only makes sense when reading from stdin. With an explicit path, we
     // bail rather than silently ignoring the flag.

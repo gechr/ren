@@ -76,6 +76,7 @@ pub struct Config {
     pub write: Option<bool>,
     pub preview: Option<bool>,
     pub create_dirs: Option<bool>,
+    pub directory: Option<String>,
 }
 
 /// Resolve the config path, parse it if present, project each set field
@@ -131,6 +132,7 @@ fn apply_to_env(cfg: &Config, origin: &mut Origin) {
     set_bool(cfg.write, "REN_WRITE", origin);
     set_bool(cfg.preview, "REN_PREVIEW", origin);
     set_bool(cfg.create_dirs, "REN_CREATE_DIRS", origin);
+    set_str(cfg.directory.as_deref(), "REN_DIRECTORY", origin);
 }
 
 fn set_bool(value: Option<bool>, key: &'static str, origin: &mut Origin) {
