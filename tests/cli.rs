@@ -349,6 +349,63 @@ fn only_extension_flag_matches_extension_and_preserves_stem() {
 }
 
 #[test]
+fn change_extension_flag_swaps_extension_and_keeps_stem() {
+    // `-E` overrides the reattached extension while leaving the stem alone.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("photo.jpg"), "").unwrap();
+
+    ren(&dir).args(["-W", "-E", "png"]).assert().success();
+
+    assert!(dir.path().join("photo.png").exists());
+    assert!(!dir.path().join("photo.jpg").exists());
+}
+
+#[test]
+fn change_extension_combines_with_supplant_to_rename_and_retype() {
+    // The headline combination: renumber the stem AND change the extension in
+    // a single pass. `image_a.jpg` / `image_b.jpg` become `1.png` / `2.png`.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("image_a.jpg"), "").unwrap();
+    fs::write(dir.path().join("image_b.jpg"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "-s", "{n}", "-E", "png"])
+        .assert()
+        .success();
+
+    assert!(dir.path().join("1.png").exists());
+    assert!(dir.path().join("2.png").exists());
+    assert!(!dir.path().join("image_a.jpg").exists());
+    assert!(!dir.path().join("image_b.jpg").exists());
+}
+
+#[test]
+fn change_extension_empty_strips_extension() {
+    // `-E ''` drops the extension entirely.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.bak"), "").unwrap();
+
+    ren(&dir).args(["-W", "-E", ""]).assert().success();
+
+    assert!(dir.path().join("notes").exists());
+    assert!(!dir.path().join("notes.bak").exists());
+}
+
+#[test]
+fn change_extension_conflicts_with_only_extension() {
+    // `-E` and `-X` both redefine extension handling, so combining them errs.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.jpg"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "-E", "png", "-X", "rs", "txt"])
+        .assert()
+        .failure();
+
+    assert!(dir.path().join("foo.jpg").exists());
+}
+
+#[test]
 fn multiple_expressions_apply_in_order_in_one_pass() {
     // `-e foo bar -e baz qux` runs both substitutions in sequence on each
     // basename. `foo_baz.txt` becomes `bar_qux.txt`.

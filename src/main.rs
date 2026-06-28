@@ -186,6 +186,24 @@ struct Cli {
     )]
     supplant: Option<String>,
 
+    /// Change, add, or strip the file extension
+    ///
+    /// Overrides the extension that the default (stem) pipeline reattaches, so
+    /// it composes with the rest of the pipeline: `ren -s '{n:02}' -E png`
+    /// renames to `01.png`, `02.png`, …. A leading dot is optional (`-E png`
+    /// and `-E .png` are equivalent). Files without an extension gain one
+    /// (`Makefile` → `Makefile.png`); an empty value strips it (`-E ''` turns
+    /// `notes.bak` into `notes`). The whole extension is replaced, including
+    /// compound ones (`archive.tar.gz` → `archive.zip`). Mutually exclusive
+    /// with `-x`/`-X`.
+    #[arg(
+        short = 'E',
+        long = "change-extension",
+        value_name = "EXT",
+        env = "REN_CHANGE_EXTENSION"
+    )]
+    change_extension: Option<String>,
+
     /// Find replace expression
     #[arg(short = 'e', long = "expression", value_name = "<find> <replace>")]
     expressions: Vec<String>,
@@ -320,6 +338,7 @@ fn print_help() {
   {red}-D{reset}, {red}--include-dirs{reset}        Also rename directories
   {red}-x{reset}, {red}--include-extension{reset}   Include extension in matching and replacement
   {red}-X{reset}, {red}--only-extension{reset}      Match the file extension only
+  {red}-E{reset}, {red}--change-extension{reset}    Change, add, or strip the file extension
 
 {yellow}{bold}Transforms{reset}
 
@@ -399,6 +418,9 @@ fn print_help_long() {
   {grey}# Match only the extension; preserve the stem (foo.rs → foo.txt){reset}
   {green}${reset} ren -X rs txt
 
+  {grey}# Renumber and change extension at once (photo_*.jpg → 01.webp, …){reset}
+  {green}${reset} ren -s '{{n:02}}' -E webp
+
   {grey}# Smart-rename across case variants:{reset}
   {grey}#  \"foo_bar\" → \"hello_world\", \"FooBar\" → \"HelloWorld\", etc.{reset}
   {green}${reset} ren --smart foo_bar hello_world
@@ -428,16 +450,16 @@ fn print_help_long() {
   {grey}#  (a/b/c.txt → out/a/b/c.txt; -d implies --create-dirs){reset}
   {green}${reset} ren -R -d out foo bar
 
-  {grey}# Number all files: 01_foo.txt, 02_bar.txt, ... (smart per-dir width){reset}
+  {grey}# Number all files: 01_foo.txt, 02_bar.txt, … (smart per-dir width){reset}
   {green}${reset} ren --prepend '{{N}}_'
 
   {grey}# Custom counter format with explicit zero-padding{reset}
   {green}${reset} ren --prepend='{{n:03}}_'
 
-  {grey}# Counter as a suffix on the stem (foo.txt → foo-1.txt, ...){reset}
+  {grey}# Counter as a suffix on the stem (foo.txt → foo-1.txt, …){reset}
   {green}${reset} ren --append '-{{n}}'
 
-  {grey}# Replace the whole name with a counter: 01.jpg, 02.jpg, ...{reset}
+  {grey}# Replace the whole name with a counter: 01.jpg, 02.jpg, …{reset}
   {green}${reset} ren --supplant '{{n:02}}'
 
   {grey}# Lowercase every name in cwd{reset}
@@ -476,13 +498,14 @@ impl Cli {
     }
 
     /// True when any transform flag (`--lower`, `--upper`, `--prepend`,
-    /// `--append`) is set.
+    /// `--append`, `--supplant`, `--change-extension`) is set.
     fn uses_transforms(&self) -> bool {
         self.lower
             || self.upper
             || self.append.is_some()
             || self.prepend.is_some()
             || self.supplant.is_some()
+            || self.change_extension.is_some()
     }
 
     /// True when a transform is present and no other mode (expressions,
@@ -577,9 +600,36 @@ fn resolve_mutex_groups(
     cli.lower = case == Some("lower");
     cli.upper = case == Some("upper");
 
-    let ext = resolve_group(matches, origin, &["include_extension", "only_extension"])?;
+    // Extension scope: `-x`, `-X`, and `-E` all redefine how the extension is
+    // handled, so at most one may win. `-E` carries a value rather than being a
+    // bool flag, so its membership is decided by a predicate: an explicit CLI
+    // `-E` (even `-E ''`, which strips) is active, but an *empty*
+    // `REN_CHANGE_EXTENSION` from the environment is inert - a stray empty env
+    // var must not silently rewrite every extension.
+    let ext = resolve_group_with(
+        matches,
+        origin,
+        &["include_extension", "only_extension", "change_extension"],
+        |id| {
+            if id == "change_extension" {
+                match matches.value_source(id) {
+                    Some(ValueSource::CommandLine) => true,
+                    Some(ValueSource::EnvVariable) => {
+                        matches.get_one::<String>(id).is_some_and(|v| !v.is_empty())
+                    }
+                    _ => false,
+                }
+            } else {
+                matches.get_flag(id)
+            }
+        },
+    )?;
     cli.include_extension = ext == Some("include_extension");
     cli.only_extension = ext == Some("only_extension");
+    if ext != Some("change_extension") {
+        // Either `-x`/`-X` outranked it, or it was an inert empty env var.
+        cli.change_extension = None;
+    }
 
     // Empty-string values for `Option<String>` env vars come through as
     // `Some("")`, which would trip `uses_transforms()` and silently switch
@@ -599,16 +649,30 @@ fn resolve_mutex_groups(
     Ok(())
 }
 
-/// Pick the winner of an "at most one is true" group. Higher tier wins;
-/// same-tier conflicts are errors with wording specific to the source.
+/// Pick the winner of an "at most one is true" group of boolean flags. Higher
+/// tier wins; same-tier conflicts are errors with wording specific to the
+/// source.
 fn resolve_group<'a>(
     matches: &ArgMatches,
     origin: &config::Origin,
     ids: &[&'a str],
 ) -> Result<Option<&'a str>> {
+    resolve_group_with(matches, origin, ids, |id| matches.get_flag(id))
+}
+
+/// As [`resolve_group`], but membership is decided by `is_active` rather than
+/// `ArgMatches::get_flag`. This admits value-bearing options (e.g.
+/// `--change-extension`) into a mutex group, where "active" means more than
+/// "the flag is true" - the predicate can inspect the value and its source.
+fn resolve_group_with<'a>(
+    matches: &ArgMatches,
+    origin: &config::Origin,
+    ids: &[&'a str],
+    is_active: impl Fn(&str) -> bool,
+) -> Result<Option<&'a str>> {
     let mut by_tier: [Vec<&'a str>; Tier::COUNT] = std::array::from_fn(|_| Vec::new());
     for id in ids {
-        if !matches.get_flag(id) {
+        if !is_active(id) {
             continue;
         }
         if let Some(tier) = tier_of(id, matches, origin) {
@@ -717,6 +781,7 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
         "prepend" => "REN_PREPEND",
         "append" => "REN_APPEND",
         "supplant" => "REN_SUPPLANT",
+        "change_extension" => "REN_CHANGE_EXTENSION",
         "dry_run" => "REN_DRY_RUN",
         "write" => "REN_WRITE",
         "preview" => "REN_PREVIEW",
@@ -1465,6 +1530,7 @@ fn run() -> Result<()> {
         &records,
         &exprs,
         scope,
+        cli.change_extension.as_deref(),
         &transforms_opts,
         cli.directory.as_deref(),
     );
@@ -2133,6 +2199,49 @@ mod tests {
             err.contains("environment variables"),
             "expected env-conflict wording, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_change_extension_conflicts_with_scope_flags_on_cli() {
+        for scope_flag in ["--only-extension", "--include-extension"] {
+            let err = parse_and_resolve(&["ren", "-E", "png", scope_flag, "foo", "bar"])
+                .err()
+                .unwrap_or_else(|| panic!("CLI conflict expected for {scope_flag}"));
+            assert!(
+                err.to_string().contains("--change-extension")
+                    && err.to_string().contains(&scope_flag[2..]),
+                "expected CLI mutex error for {scope_flag}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_change_extension_beats_shell_env_only_extension() {
+        let _g = EnvGuard::set(&[("REN_ONLY_EXTENSION", "true")]);
+        let cli = resolve_with_origin(
+            &["ren", "-E", "png", "foo", "bar"],
+            &config::Origin::default(),
+        )
+        .unwrap();
+        assert_eq!(cli.change_extension.as_deref(), Some("png"));
+        assert!(!cli.only_extension);
+    }
+
+    #[test]
+    fn test_empty_change_extension_env_is_ignored() {
+        // A stray empty REN_CHANGE_EXTENSION must not be treated as a request to
+        // strip every file's extension; it resolves to "unset".
+        let _g = EnvGuard::set(&[("REN_CHANGE_EXTENSION", "")]);
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        assert_eq!(cli.change_extension, None);
+    }
+
+    #[test]
+    fn test_cli_empty_change_extension_is_retained_for_stripping() {
+        // An *explicit* `-E ''` on the command line is a real request to strip,
+        // so it survives resolution (unlike the empty env var above).
+        let cli = parse_and_resolve(&["ren", "-E", "", "foo", "bar"]).unwrap();
+        assert_eq!(cli.change_extension.as_deref(), Some(""));
     }
 
     #[test]

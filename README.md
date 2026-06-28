@@ -60,8 +60,11 @@ ren -x rs txt
 # Match only the extension; preserve the stem (foo.rs -> foo.txt)
 ren -X rs txt
 
+# Rename and change the extension in one pass (img_a.jpg, img_b.jpg -> 1.png, 2.png)
+ren -W -s '{n}' -E png
+
 # Smart-rename across case variants
-#   foo_bar -> hello_world, FooBar -> HelloWorld, FOO_BAR -> HELLO_WORLD, ...
+#   foo_bar -> hello_world, FooBar -> HelloWorld, FOO_BAR -> HELLO_WORLD, …
 ren --smart foo_bar hello_world
 
 # Regex rename: replace test_ prefix with spec_
@@ -79,16 +82,16 @@ ren -l foo
 # Case-only rename (works on case-insensitive filesystems too)
 ren -W tmp TMP
 
-# Number every file in cwd: 01_alpha.txt, 02_beta.txt, ... (smart per-dir width)
+# Number every file in cwd: 01_alpha.txt, 02_beta.txt, … (smart per-dir width)
 ren --prepend '{N}_'
 
 # Custom counter format with explicit zero-padding and a path scope
 ren --prepend='{n:03}_' src/
 
-# Number files as a suffix on the stem: foo.txt -> foo-1.txt, ...
+# Number files as a suffix on the stem: foo.txt -> foo-1.txt, …
 ren --append '-{n}'
 
-# Replace each name outright: 01.jpg, 02.jpg, ... (extension preserved)
+# Replace each name outright: 01.jpg, 02.jpg, … (extension preserved)
 ren --supplant '{n:02}'
 
 # Lowercase every basename in cwd
@@ -102,13 +105,14 @@ ren --prepend '{N}_' --lower foo bar
 
 When `<find> <replace>` alone isn't enough, transforms layer over the find/replace stage. They're optional, compose with each other, and make `<find> <replace>` itself optional too - so `ren --prepend '{N}_'` is a valid invocation.
 
-| Flag                     | Effect                                                                                             |
-| ------------------------ | -------------------------------------------------------------------------------------------------- |
-| `-L`, `--lower`          | lowercase the basename (mutex with `--upper`)                                                      |
-| `-U`, `--upper`          | uppercase the basename                                                                             |
-| `-P`, `--prepend <fmt>`  | prepend a literal string or template                                                               |
-| `-A`, `--append <fmt>`   | append a literal string or template                                                                |
-| `-s`, `--supplant <fmt>` | replace the name with a literal string or template (extension preserved unless combined with `-x`) |
+| Flag                             | Effect                                                                                             |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `-L`, `--lower`                  | lowercase the basename (mutex with `--upper`)                                                      |
+| `-U`, `--upper`                  | uppercase the basename                                                                             |
+| `-P`, `--prepend <fmt>`          | prepend a literal string or template                                                               |
+| `-A`, `--append <fmt>`           | append a literal string or template                                                                |
+| `-s`, `--supplant <fmt>`         | replace the name with a literal string or template (extension preserved unless combined with `-x`) |
+| `-E`, `--change-extension <ext>` | change, add, or strip the file extension (composes with the stem pipeline; mutex with `-x`/`-X`)   |
 
 Counter templates (recognised inside `--prepend`, `--append`, and `--supplant`):
 
@@ -126,7 +130,7 @@ The pipeline runs in fixed canonical order regardless of argv order:
 4. `--append`
 5. `--prepend`
 
-By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `1` (or `01`, `001`, … with a width specifier). Files filtered out by find/replace don't consume a counter slot.
+By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. `-E/--change-extension <ext>` is orthogonal: it overrides the reattached extension while the rest of the pipeline still runs on the stem, so it composes with `--supplant` and friends (`ren -s '{n:02}' -E png` → `01.png`, `02.png`, …). A leading dot is optional, files without an extension gain one, and an empty value (`-E ''`) strips it; the whole extension is replaced, including compound ones (`archive.tar.gz` → `archive.zip`). It is mutually exclusive with `-x`/`-X`. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `1` (or `01`, `001`, … with a width specifier). Files filtered out by find/replace don't consume a counter slot.
 
 ## Preview keymap
 

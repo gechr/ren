@@ -143,6 +143,7 @@ pub(crate) fn build_plan(
     records: &[scan::PathRecord],
     exprs: &[expressions::CompiledExpression],
     scope: ExtensionScope,
+    change_ext: Option<&str>,
     transforms_opts: &transforms::TransformOptions,
     target_dir: Option<&Path>,
 ) -> Vec<PlanEntry> {
@@ -199,9 +200,22 @@ pub(crate) fn build_plan(
             ExtensionScope::Exclude => {
                 let (stem, ext) = split_stem_ext(basename);
                 prefix = String::new();
-                suffix = match ext {
-                    Some(e) => format!(".{e}"),
-                    None => String::new(),
+                // `-E` overrides the reattached extension. A single leading dot
+                // is optional; an empty value drops the extension entirely.
+                // Without `-E`, the original extension is preserved.
+                suffix = match change_ext {
+                    Some(new) => {
+                        let e = new.strip_prefix('.').unwrap_or(new);
+                        if e.is_empty() {
+                            String::new()
+                        } else {
+                            format!(".{e}")
+                        }
+                    }
+                    None => match ext {
+                        Some(e) => format!(".{e}"),
+                        None => String::new(),
+                    },
                 };
                 working_input = stem;
             }
@@ -543,6 +557,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Include,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -774,6 +789,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Include,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -799,6 +815,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Include,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -820,6 +837,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Exclude,
+            None,
             &transforms::TransformOptions::default(),
             Some(Path::new("foo/bar")),
         );
@@ -840,6 +858,7 @@ mod tests {
                 &records,
                 &exprs,
                 ExtensionScope::Exclude,
+                None,
                 &transforms::TransformOptions::default(),
                 Some(Path::new(dir)),
             )[0]
@@ -867,7 +886,7 @@ mod tests {
             prepend: Some("{n:02}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01_a.txt"));
         assert_eq!(plan[1].new, tmp.path().join("02_b.txt"));
@@ -889,7 +908,7 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("b-2.txt"));
@@ -909,7 +928,7 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01.jpg"));
         assert_eq!(plan[1].new, tmp.path().join("02.jpg"));
@@ -929,10 +948,158 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("01"));
         assert_eq!(plan[1].new, tmp.path().join("02"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_replaces_extension() {
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("foo.jpg"), tmp.path().to_path_buf()),
+            record(tmp.path().join("bar.jpeg"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions::default();
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some("png"),
+            &opts,
+            None,
+        );
+
+        assert_eq!(plan[0].new, tmp.path().join("foo.png"));
+        assert_eq!(plan[1].new, tmp.path().join("bar.png"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_leading_dot_is_optional() {
+        // `png` and `.png` are equivalent; a *second* dot is preserved verbatim.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![record(tmp.path().join("foo.jpg"), tmp.path().to_path_buf())];
+        let opts = transforms::TransformOptions::default();
+
+        let dotted = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some(".png"),
+            &opts,
+            None,
+        );
+        assert_eq!(dotted[0].new, tmp.path().join("foo.png"));
+
+        let double = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some("..png"),
+            &opts,
+            None,
+        );
+        assert_eq!(double[0].new, tmp.path().join("foo..png"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_combines_with_supplant() {
+        // The headline use case: renumber the stem AND change the extension in
+        // one pass. `--supplant` rewrites the stem; `-E` overrides the suffix.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("photo_a.jpg"), tmp.path().to_path_buf()),
+            record(tmp.path().join("photo_b.jpg"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions {
+            supplant: Some("{n:02}".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some("webp"),
+            &opts,
+            None,
+        );
+
+        assert_eq!(plan[0].new, tmp.path().join("01.webp"));
+        assert_eq!(plan[1].new, tmp.path().join("02.webp"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_adds_to_extensionless_files() {
+        // Files without an extension gain one; dotfiles are treated as having
+        // no extension (the leading dot is part of the name).
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("Makefile"), tmp.path().to_path_buf()),
+            record(tmp.path().join(".bashrc"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions::default();
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some("png"),
+            &opts,
+            None,
+        );
+
+        assert_eq!(plan[0].new, tmp.path().join("Makefile.png"));
+        assert_eq!(plan[1].new, tmp.path().join(".bashrc.png"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_empty_strips_extension() {
+        // An empty value drops the extension; a file that already lacks one is
+        // unchanged and so is skipped by the no-op guard.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("notes.bak"), tmp.path().to_path_buf()),
+            record(tmp.path().join("Makefile"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions::default();
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some(""),
+            &opts,
+            None,
+        );
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].old, tmp.path().join("notes.bak"));
+        assert_eq!(plan[0].new, tmp.path().join("notes"));
+    }
+
+    #[test]
+    fn build_plan_change_extension_replaces_whole_compound_extension() {
+        // The entire extension is replaced, including recognised compound ones.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![record(
+            tmp.path().join("archive.tar.gz"),
+            tmp.path().to_path_buf(),
+        )];
+
+        let opts = transforms::TransformOptions::default();
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            Some("zip"),
+            &opts,
+            None,
+        );
+
+        assert_eq!(plan[0].new, tmp.path().join("archive.zip"));
     }
 
     #[test]
@@ -950,7 +1117,7 @@ mod tests {
             supplant: Some("same".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
 
         // Both collapse to `same.txt`.
         assert_eq!(plan[0].new, tmp.path().join("same.txt"));
@@ -975,7 +1142,7 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("001_file-0.txt"));
         assert_eq!(plan[98].new, tmp.path().join("099_file-98.txt"));
@@ -999,7 +1166,7 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
 
         assert_eq!(plan[0].new, small.join("01_only.txt"));
         assert_eq!(plan[1].new, large.join("001_file-0.txt"));
@@ -1019,7 +1186,7 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts, None);
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
 
         assert_eq!(plan[0].new, tmp.path().join("1-a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("2-b-2.txt"));
@@ -1079,6 +1246,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Exclude,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -1091,6 +1259,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Include,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -1123,6 +1292,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Exclude,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -1145,6 +1315,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Exclude,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -1175,6 +1346,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Only,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
@@ -1203,6 +1375,7 @@ mod tests {
             &records,
             &exprs,
             ExtensionScope::Only,
+            None,
             &transforms::TransformOptions::default(),
             None,
         );
