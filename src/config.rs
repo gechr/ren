@@ -71,6 +71,7 @@ pub struct Config {
     pub upper: Option<bool>,
     pub prepend: Option<String>,
     pub append: Option<String>,
+    pub supplant: Option<String>,
     pub dry_run: Option<bool>,
     pub write: Option<bool>,
     pub preview: Option<bool>,
@@ -125,6 +126,7 @@ fn apply_to_env(cfg: &Config, origin: &mut Origin) {
     set_bool(cfg.upper, "REN_UPPER", origin);
     set_str(cfg.prepend.as_deref(), "REN_PREPEND", origin);
     set_str(cfg.append.as_deref(), "REN_APPEND", origin);
+    set_str(cfg.supplant.as_deref(), "REN_SUPPLANT", origin);
     set_bool(cfg.dry_run, "REN_DRY_RUN", origin);
     set_bool(cfg.write, "REN_WRITE", origin);
     set_bool(cfg.preview, "REN_PREVIEW", origin);
@@ -202,6 +204,7 @@ regex = true
 word-regexp = true
 prepend = \"{N}_\"
 append = \"-{n}\"
+supplant = \"{n:02}\"
 ",
         );
         assert_eq!(cfg.hidden, Some(true));
@@ -214,6 +217,7 @@ append = \"-{n}\"
         assert_eq!(cfg.word_regexp, Some(true));
         assert_eq!(cfg.prepend.as_deref(), Some("{N}_"));
         assert_eq!(cfg.append.as_deref(), Some("-{n}"));
+        assert_eq!(cfg.supplant.as_deref(), Some("{n:02}"));
     }
 
     #[test]

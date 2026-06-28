@@ -88,6 +88,9 @@ ren --prepend='{n:03}_' src/
 # Number files as a suffix on the stem: foo.txt -> foo-1.txt, ...
 ren --append '-{n}'
 
+# Replace each name outright: 01.jpg, 02.jpg, ... (extension preserved)
+ren --supplant '{n:02}'
+
 # Lowercase every basename in cwd
 ren --lower
 
@@ -99,14 +102,15 @@ ren --prepend '{N}_' --lower foo bar
 
 When `<find> <replace>` alone isn't enough, transforms layer over the find/replace stage. They're optional, compose with each other, and make `<find> <replace>` itself optional too - so `ren --prepend '{N}_'` is a valid invocation.
 
-| Flag                    | Effect                                        |
-| ----------------------- | --------------------------------------------- |
-| `-L`, `--lower`         | lowercase the basename (mutex with `--upper`) |
-| `-U`, `--upper`         | uppercase the basename                        |
-| `-P`, `--prepend <fmt>` | prepend a literal string or template          |
-| `-A`, `--append <fmt>`  | append a literal string or template           |
+| Flag                     | Effect                                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------------------------- |
+| `-L`, `--lower`          | lowercase the basename (mutex with `--upper`)                                                      |
+| `-U`, `--upper`          | uppercase the basename                                                                             |
+| `-P`, `--prepend <fmt>`  | prepend a literal string or template                                                               |
+| `-A`, `--append <fmt>`   | append a literal string or template                                                                |
+| `-s`, `--supplant <fmt>` | replace the name with a literal string or template (extension preserved unless combined with `-x`) |
 
-Counter templates (recognised inside both `--prepend` and `--append`):
+Counter templates (recognised inside `--prepend`, `--append`, and `--supplant`):
 
 - `{n}` - the 1-based per-parent-directory index (`1`, `2`, `3`, …).
 - `{n:0WIDTH}` - zero-padded to `WIDTH` digits (`{n:03}` → `001`, `002`, …).
@@ -117,9 +121,10 @@ Anything else in the format string passes through, so `[{n:02}]-`, `chapter-{n:0
 The pipeline runs in fixed canonical order regardless of argv order:
 
 1. find/replace (positional or `-e`)
-2. `--lower` *or* `--upper`
-3. `--append`
-4. `--prepend`
+2. `--supplant`
+3. `--lower` *or* `--upper`
+4. `--append`
+5. `--prepend`
 
 By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `1` (or `01`, `001`, … with a width specifier). Files filtered out by find/replace don't consume a counter slot.
 

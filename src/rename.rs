@@ -156,6 +156,10 @@ pub(crate) fn build_plan(
         || transforms_opts
             .append
             .as_deref()
+            .is_some_and(transforms::has_counter_placeholder)
+        || transforms_opts
+            .supplant
+            .as_deref()
             .is_some_and(transforms::has_counter_placeholder);
 
     if uses_counter {
@@ -835,6 +839,70 @@ mod tests {
 
         assert_eq!(plan[0].new, tmp.path().join("a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("b-2.txt"));
+    }
+
+    #[test]
+    fn build_plan_supplant_replaces_stem_and_preserves_extension() {
+        // The headline use case: `--supplant '{n:02}'` renumbers every file to
+        // 01, 02, … while the default (Exclude) scope reattaches the extension.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("photo_a.jpg"), tmp.path().to_path_buf()),
+            record(tmp.path().join("photo_b.jpg"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions {
+            supplant: Some("{n:02}".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+
+        assert_eq!(plan[0].new, tmp.path().join("01.jpg"));
+        assert_eq!(plan[1].new, tmp.path().join("02.jpg"));
+    }
+
+    #[test]
+    fn build_plan_supplant_with_include_extension_replaces_entire_basename() {
+        // `-x` (Include scope) makes the working segment the FULL basename, so
+        // `--supplant` overwrites the extension too: `photo_a.jpg` → `01`.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("photo_a.jpg"), tmp.path().to_path_buf()),
+            record(tmp.path().join("photo_b.png"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions {
+            supplant: Some("{n:02}".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Include, &opts);
+
+        assert_eq!(plan[0].new, tmp.path().join("01"));
+        assert_eq!(plan[1].new, tmp.path().join("02"));
+    }
+
+    #[test]
+    fn build_plan_supplant_literal_collapse_is_caught_by_validate() {
+        // A literal `--supplant` (no counter) maps every file in a directory to
+        // the same target; `validate_plan` must reject it rather than silently
+        // clobbering. This is the "dry-run detects the conflict" guarantee.
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            record(tmp.path().join("a.txt"), tmp.path().to_path_buf()),
+            record(tmp.path().join("b.txt"), tmp.path().to_path_buf()),
+        ];
+
+        let opts = transforms::TransformOptions {
+            supplant: Some("same".into()),
+            ..Default::default()
+        };
+        let plan = build_plan(&records, &[], ExtensionScope::Exclude, &opts);
+
+        // Both collapse to `same.txt`.
+        assert_eq!(plan[0].new, tmp.path().join("same.txt"));
+        assert_eq!(plan[1].new, tmp.path().join("same.txt"));
+        let err = validate_plan(&plan).unwrap_err();
+        assert!(format!("{err}").contains("same target"));
     }
 
     #[test]

@@ -171,6 +171,21 @@ struct Cli {
     #[arg(short = 'A', long = "append", value_name = "FMT", env = "REN_APPEND")]
     append: Option<String>,
 
+    /// Replace each name with a literal string or template
+    ///
+    /// Unlike `--prepend`/`--append`, which add to the name, `--supplant`
+    /// replaces it outright. It accepts the same counter DSL (`{n}`, `{n:0W}`,
+    /// `{N}`) and runs on the same segment as the rest of the pipeline - the
+    /// stem by default, so the extension is preserved: `ren --supplant '{n:02}'`
+    /// renames to `01.jpg`, `02.jpg`, ….
+    #[arg(
+        short = 's',
+        long = "supplant",
+        value_name = "FMT",
+        env = "REN_SUPPLANT"
+    )]
+    supplant: Option<String>,
+
     /// Find replace expression
     #[arg(short = 'e', long = "expression", value_name = "<find> <replace>")]
     expressions: Vec<String>,
@@ -274,7 +289,7 @@ fn print_help() {
 
 {yellow}{bold}Replace{reset}
 
-  {red}-e{reset}, {red}--expression {dim}<f> <r>{reset}  Find/replace expression
+  {red}-e{reset}, {red}--expression {blue}{dim}<f> <r>{reset}  Find/replace expression
   {red}-S{reset}, {red}--smart{reset}               Replace all case variants of the pattern
 
 {yellow}{bold}Regex{reset}
@@ -298,6 +313,7 @@ fn print_help() {
 
   {red}-P{reset}, {red}--prepend {dim}<fmt>{reset}       Prepend a string or template
   {red}-A{reset}, {red}--append {dim}<fmt>{reset}        Append a string or template
+  {red}-s{reset}, {red}--supplant {dim}<fmt>{reset}      Replace names with a string or template
 
 {yellow}{bold}Behavior{reset}
 
@@ -399,6 +415,9 @@ fn print_help_long() {
   {grey}# Counter as a suffix on the stem (foo.txt → foo-1.txt, ...){reset}
   {green}${reset} ren --append '-{{n}}'
 
+  {grey}# Replace the whole name with a counter: 01.jpg, 02.jpg, ...{reset}
+  {green}${reset} ren --supplant '{{n:02}}'
+
   {grey}# Lowercase every name in cwd{reset}
   {green}${reset} ren --lower
 
@@ -437,7 +456,11 @@ impl Cli {
     /// True when any transform flag (`--lower`, `--upper`, `--prepend`,
     /// `--append`) is set.
     fn uses_transforms(&self) -> bool {
-        self.lower || self.upper || self.append.is_some() || self.prepend.is_some()
+        self.lower
+            || self.upper
+            || self.append.is_some()
+            || self.prepend.is_some()
+            || self.supplant.is_some()
     }
 
     /// True when a transform is present and no other mode (expressions,
@@ -546,6 +569,9 @@ fn resolve_mutex_groups(
     }
     if cli.append.as_deref() == Some("") {
         cli.append = None;
+    }
+    if cli.supplant.as_deref() == Some("") {
+        cli.supplant = None;
     }
 
     Ok(())
@@ -668,6 +694,7 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
         "upper" => "REN_UPPER",
         "prepend" => "REN_PREPEND",
         "append" => "REN_APPEND",
+        "supplant" => "REN_SUPPLANT",
         "dry_run" => "REN_DRY_RUN",
         "write" => "REN_WRITE",
         "preview" => "REN_PREVIEW",
@@ -1081,6 +1108,7 @@ fn run() -> Result<()> {
         upper: cli.upper,
         append: cli.append.clone(),
         prepend: cli.prepend.clone(),
+        supplant: cli.supplant.clone(),
     };
 
     let records = if from_stdin {
@@ -1313,6 +1341,12 @@ mod tests {
             parse_cli(&["ren", "-P", "pfx_", "a", "b"]).positional_skip(),
             0
         );
+        // --supplant is a transform too: positionals are paths, never a
+        // phantom find/replace pair.
+        assert_eq!(
+            parse_cli(&["ren", "-s", "{n:02}", "a", "b"]).positional_skip(),
+            0
+        );
         // Expression mode wins over transforms: `-e` already implies
         // positionals are paths.
         assert_eq!(
@@ -1414,6 +1448,13 @@ mod tests {
         let upper = parse_cli(&["ren", "-U"]);
         assert!(upper.upper);
         assert!(!upper.lower);
+    }
+
+    #[test]
+    fn test_supplant_short_flag_parses() {
+        let cli = parse_cli(&["ren", "-s", "{n:02}"]);
+        assert_eq!(cli.supplant.as_deref(), Some("{n:02}"));
+        assert!(cli.uses_transforms());
     }
 
     #[test]

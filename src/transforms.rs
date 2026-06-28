@@ -2,9 +2,11 @@
 //
 // Composition is fixed canonical order, NOT argv order. The pipeline runs:
 //
-//   find/replace  →  lower XOR upper  →  append  →  prepend
+//   find/replace  →  supplant  →  lower XOR upper  →  append  →  prepend
 //
-// `--lower` and `--upper` are mutually exclusive (clap-level conflict).
+// `--supplant` replaces the working segment wholesale (whatever find/replace
+// produced is discarded), so the remaining stages layer over the rendered
+// template. `--lower` and `--upper` are mutually exclusive (clap-level conflict).
 // The pipeline runs on the file stem by default; `-x/--include-extension`
 // runs it on the full basename, and `-X/--only-extension` runs it on the
 // extension only. `build_plan` handles the split/reattach.
@@ -27,6 +29,9 @@ pub(crate) struct TransformOptions {
     pub upper: bool,
     pub append: Option<String>,
     pub prepend: Option<String>,
+    /// Replace the working segment entirely with this literal/template,
+    /// before every other stage. Accepts the same counter DSL as the affixes.
+    pub supplant: Option<String>,
 }
 
 /// Per-record counter context resolved by `build_plan`. `n` is the 1-based
@@ -40,15 +45,23 @@ pub(crate) struct CounterContext {
 }
 
 /// Apply the canonical transform pipeline to a name. `ctx` carries the counter
-/// state used to expand `{n}` / `{n:0W}` / `{N}` in `prepend` and `append`. If
-/// neither affix references a counter the values are simply unused.
+/// state used to expand `{n}` / `{n:0W}` / `{N}` in `supplant`, `prepend`, and
+/// `append`. If none of them references a counter the values are simply unused.
 pub(crate) fn apply(name: &str, opts: &TransformOptions, ctx: CounterContext) -> String {
+    // `--supplant` overwrites the working segment before any other stage, so
+    // case/append/prepend layer over the rendered template rather than over the
+    // original (post-find/replace) name.
+    let base = match opts.supplant {
+        Some(ref tmpl) => format_counter(tmpl, ctx),
+        None => name.to_string(),
+    };
+
     let mut s = if opts.lower {
-        name.to_lowercase()
+        base.to_lowercase()
     } else if opts.upper {
-        name.to_uppercase()
+        base.to_uppercase()
     } else {
-        name.to_string()
+        base
     };
 
     if let Some(ref suffix) = opts.append {
@@ -226,6 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn apply_supplant_literal_replaces_whole_name() {
+        let opts = TransformOptions {
+            supplant: Some("README".into()),
+            ..opts_default()
+        };
+        assert_eq!(apply("anything", &opts, ctx(1, 1)), "README");
+    }
+
+    #[test]
+    fn apply_supplant_with_counter_template() {
+        let opts = TransformOptions {
+            supplant: Some("{n:02}".into()),
+            ..opts_default()
+        };
+        assert_eq!(apply("photo_a", &opts, ctx(7, 0)), "07");
+    }
+
+    #[test]
+    fn apply_supplant_runs_before_affixes_and_case() {
+        // Pipeline: supplant → upper → append → prepend. `supplant` overwrites
+        // the name; `upper` cases the rendered template; the affixes wrap it.
+        let opts = TransformOptions {
+            upper: true,
+            supplant: Some("img-{n}".into()),
+            append: Some("-final".into()),
+            prepend: Some("v_".into()),
+            ..opts_default()
+        };
+        assert_eq!(apply("whatever", &opts, ctx(3, 0)), "v_IMG-3-final");
+    }
+
+    #[test]
     fn apply_append_with_counter_template() {
         let opts = TransformOptions {
             append: Some("-{n}".into()),
@@ -256,6 +301,7 @@ mod tests {
             upper: false,
             append: Some(".bak".into()),
             prepend: Some("draft_".into()),
+            ..opts_default()
         };
         assert_eq!(apply("Foo", &opts, ctx(1, 1)), "draft_foo.bak");
     }
