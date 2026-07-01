@@ -146,6 +146,7 @@ pub(crate) fn build_plan(
     change_ext: Option<&str>,
     transforms_opts: &transforms::TransformOptions,
     target_dir: Option<&Path>,
+    parents: bool,
 ) -> Vec<PlanEntry> {
     let mut plan = Vec::with_capacity(records.len());
     let mut dir_counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
@@ -246,18 +247,41 @@ pub(crate) fn build_plan(
             continue;
         }
 
-        let new = record
-            .path
-            .parent()
-            .map(|p| p.join(&new_basename))
-            .unwrap_or_else(|| PathBuf::from(&new_basename));
-
-        // `-d <dir>` relocates the whole computed target under <dir>:
-        // `foo/bar` + `a/b/c` => `foo/bar/a/b/c`. `Path::join` normalizes a
-        // trailing slash, so `a/b` and `a/b/` behave identically.
+        // `-d <dir>` relocates the renamed file under <dir>; otherwise the
+        // rename happens in place, keeping the source's parent directory.
+        //
+        // Under `-d`, the default is to flatten - only the new basename lands
+        // in <dir>, so `x.jpg` + `-d out` => `out/x.jpg`. This is deliberate:
+        // the source path is frequently absolute (shell-expanded globs), and
+        // `Path::join` discards its base when the argument is absolute, so
+        // joining the full source path would silently ignore `-d` entirely.
+        //
+        // `--parents` opts into reproducing the source's parent structure
+        // *relative to its walk root* under <dir>: a file found at
+        // `photos/2024/x.jpg` under root `photos` lands at `out/2024/x.jpg`.
+        // For shell-expanded globs each file is its own root, so the relative
+        // parent is empty and `--parents` coincides with flatten.
         let new = match target_dir {
-            Some(dir) => dir.join(&new),
-            None => new,
+            Some(dir) => {
+                let relative = if parents {
+                    record
+                        .path
+                        .strip_prefix(&record.root)
+                        .ok()
+                        .and_then(Path::parent)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.join(&new_basename))
+                        .unwrap_or_else(|| PathBuf::from(&new_basename))
+                } else {
+                    PathBuf::from(&new_basename)
+                };
+                dir.join(relative)
+            }
+            None => record
+                .path
+                .parent()
+                .map(|p| p.join(&new_basename))
+                .unwrap_or_else(|| PathBuf::from(&new_basename)),
         };
 
         let depth = record
@@ -560,6 +584,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert_eq!(plan.len(), 1);
         validate_plan(&plan).unwrap();
@@ -792,6 +817,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert!(plan.is_empty());
 
@@ -818,6 +844,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
 
         assert_eq!(plan.len(), 1);
@@ -828,10 +855,14 @@ mod tests {
     // ---- target directory (`-d`) -----------------------------------------
 
     #[test]
-    fn build_plan_target_dir_relocates_under_base() {
+    fn build_plan_target_dir_flattens_by_default() {
         // `build_plan` is pure path/string manipulation (no fs access), so
-        // synthetic relative paths exercise the relocation directly.
-        let records = vec![record(PathBuf::from("a/b/c.txt"), PathBuf::from("."))];
+        // synthetic paths exercise the relocation directly. The default drops
+        // only the renamed basename into <dir>, discarding the source's parents.
+        let records = vec![record(
+            PathBuf::from("photos/a/b/c.txt"),
+            PathBuf::from("photos"),
+        )];
         let exprs = compile("c", "z");
         let plan = build_plan(
             &records,
@@ -840,13 +871,60 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             Some(Path::new("foo/bar")),
+            false,
         );
 
         assert_eq!(plan.len(), 1);
-        // foo/bar + a/b/z.txt => foo/bar/a/b/z.txt
-        assert_eq!(plan[0].new, PathBuf::from("foo/bar/a/b/z.txt"));
+        // Flatten: foo/bar + z.txt => foo/bar/z.txt (parents dropped).
+        assert_eq!(plan[0].new, PathBuf::from("foo/bar/z.txt"));
         // The source is untouched by `-d`.
-        assert_eq!(plan[0].old, PathBuf::from("a/b/c.txt"));
+        assert_eq!(plan[0].old, PathBuf::from("photos/a/b/c.txt"));
+    }
+
+    #[test]
+    fn build_plan_target_dir_absolute_source_flattens() {
+        // Regression: shell-expanded globs yield absolute source paths, where
+        // each file is its own walk root. `Path::join` discards its base when
+        // the argument is absolute, so the pre-flatten `dir.join(full_path)`
+        // silently ignored `-d`. Flattening on the basename avoids that trap.
+        let src = PathBuf::from("/home/u/Downloads/x.jpeg");
+        let records = vec![record(src.clone(), src.clone())];
+        let exprs = compile("x", "01");
+        let plan = build_plan(
+            &records,
+            &exprs,
+            ExtensionScope::Exclude,
+            None,
+            &transforms::TransformOptions::default(),
+            Some(Path::new("/mnt/images")),
+            false,
+        );
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].new, PathBuf::from("/mnt/images/01.jpeg"));
+    }
+
+    #[test]
+    fn build_plan_target_dir_parents_preserves_structure() {
+        // `--parents` reproduces the source's parents relative to its walk root.
+        let records = vec![record(
+            PathBuf::from("photos/a/b/c.txt"),
+            PathBuf::from("photos"),
+        )];
+        let exprs = compile("c", "z");
+        let plan = build_plan(
+            &records,
+            &exprs,
+            ExtensionScope::Exclude,
+            None,
+            &transforms::TransformOptions::default(),
+            Some(Path::new("foo/bar")),
+            true,
+        );
+
+        assert_eq!(plan.len(), 1);
+        // Preserve the `a/b` structure below the root under <dir>.
+        assert_eq!(plan[0].new, PathBuf::from("foo/bar/a/b/z.txt"));
     }
 
     #[test]
@@ -861,6 +939,7 @@ mod tests {
                 None,
                 &transforms::TransformOptions::default(),
                 Some(Path::new(dir)),
+                false,
             )[0]
             .new
             .clone()
@@ -886,7 +965,15 @@ mod tests {
             prepend: Some("{n:02}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Include,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("01_a.txt"));
         assert_eq!(plan[1].new, tmp.path().join("02_b.txt"));
@@ -908,7 +995,15 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("b-2.txt"));
@@ -928,7 +1023,15 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("01.jpg"));
         assert_eq!(plan[1].new, tmp.path().join("02.jpg"));
@@ -948,7 +1051,15 @@ mod tests {
             supplant: Some("{n:02}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Include,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("01"));
         assert_eq!(plan[1].new, tmp.path().join("02"));
@@ -970,6 +1081,7 @@ mod tests {
             Some("png"),
             &opts,
             None,
+            false,
         );
 
         assert_eq!(plan[0].new, tmp.path().join("foo.png"));
@@ -990,6 +1102,7 @@ mod tests {
             Some(".png"),
             &opts,
             None,
+            false,
         );
         assert_eq!(dotted[0].new, tmp.path().join("foo.png"));
 
@@ -1000,6 +1113,7 @@ mod tests {
             Some("..png"),
             &opts,
             None,
+            false,
         );
         assert_eq!(double[0].new, tmp.path().join("foo..png"));
     }
@@ -1025,6 +1139,7 @@ mod tests {
             Some("webp"),
             &opts,
             None,
+            false,
         );
 
         assert_eq!(plan[0].new, tmp.path().join("01.webp"));
@@ -1049,6 +1164,7 @@ mod tests {
             Some("png"),
             &opts,
             None,
+            false,
         );
 
         assert_eq!(plan[0].new, tmp.path().join("Makefile.png"));
@@ -1073,6 +1189,7 @@ mod tests {
             Some(""),
             &opts,
             None,
+            false,
         );
 
         assert_eq!(plan.len(), 1);
@@ -1097,6 +1214,7 @@ mod tests {
             Some("zip"),
             &opts,
             None,
+            false,
         );
 
         assert_eq!(plan[0].new, tmp.path().join("archive.zip"));
@@ -1117,7 +1235,15 @@ mod tests {
             supplant: Some("same".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         // Both collapse to `same.txt`.
         assert_eq!(plan[0].new, tmp.path().join("same.txt"));
@@ -1142,7 +1268,15 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Include,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("001_file-0.txt"));
         assert_eq!(plan[98].new, tmp.path().join("099_file-98.txt"));
@@ -1166,7 +1300,15 @@ mod tests {
             prepend: Some("{N}_".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Include, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Include,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, small.join("01_only.txt"));
         assert_eq!(plan[1].new, large.join("001_file-0.txt"));
@@ -1186,7 +1328,15 @@ mod tests {
             append: Some("-{n}".into()),
             ..Default::default()
         };
-        let plan = build_plan(&records, &[], ExtensionScope::Exclude, None, &opts, None);
+        let plan = build_plan(
+            &records,
+            &[],
+            ExtensionScope::Exclude,
+            None,
+            &opts,
+            None,
+            false,
+        );
 
         assert_eq!(plan[0].new, tmp.path().join("1-a-1.txt"));
         assert_eq!(plan[1].new, tmp.path().join("2-b-2.txt"));
@@ -1249,6 +1399,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, txt_named);
@@ -1262,6 +1413,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert_eq!(plan_full.len(), 2);
     }
@@ -1295,6 +1447,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].old, archive);
@@ -1318,6 +1471,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
 
         assert_eq!(plan.len(), 1);
@@ -1349,6 +1503,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
 
         assert_eq!(plan.len(), 2);
@@ -1378,6 +1533,7 @@ mod tests {
             None,
             &transforms::TransformOptions::default(),
             None,
+            false,
         );
         assert!(plan.is_empty());
     }

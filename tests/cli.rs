@@ -505,9 +505,10 @@ fn missing_parent_without_create_dirs_fails_and_rolls_back() {
 }
 
 #[test]
-fn directory_relocates_matches_preserving_subtree() {
-    // `a/b/foo.txt` renamed with `-d out` lands at `out/a/b/bar.txt`, and the
-    // intermediate `out/a/b` tree is created automatically (no `--create-dirs`).
+fn directory_relocates_flattening_by_default() {
+    // `a/b/foo.txt` renamed with `-d out` flattens to `out/bar.txt` by default;
+    // the source's `a/b` parents are dropped. The `out` dir is created
+    // automatically (no `--create-dirs`).
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join("a/b")).unwrap();
     fs::write(dir.path().join("a/b/foo.txt"), "").unwrap();
@@ -517,8 +518,39 @@ fn directory_relocates_matches_preserving_subtree() {
         .assert()
         .success();
 
+    assert!(dir.path().join("out/bar.txt").exists());
+    assert!(!dir.path().join("out/a/b/bar.txt").exists());
+    assert!(!dir.path().join("a/b/foo.txt").exists());
+}
+
+#[test]
+fn directory_relocates_preserving_subtree_with_parents() {
+    // `--parents` recreates the source's `a/b` structure under `-d out`, so
+    // `a/b/foo.txt` lands at `out/a/b/bar.txt`; intermediate dirs are created.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("a/b")).unwrap();
+    fs::write(dir.path().join("a/b/foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "-R", "-d", "out", "--parents", "foo", "bar"])
+        .assert()
+        .success();
+
     assert!(dir.path().join("out/a/b/bar.txt").exists());
     assert!(!dir.path().join("a/b/foo.txt").exists());
+}
+
+#[test]
+fn parents_without_directory_errors() {
+    // `--parents` only makes sense alongside `-d`; used alone it must error
+    // rather than silently do nothing.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("foo.txt"), "").unwrap();
+
+    ren(&dir)
+        .args(["-W", "--parents", "foo", "bar", "."])
+        .assert()
+        .failure();
 }
 
 #[test]

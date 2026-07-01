@@ -267,10 +267,11 @@ struct Cli {
 
     /// Relocate renamed files under this base directory.
     ///
-    /// The computed target path is joined onto `<dir>`, so a rename producing
-    /// `a/b/c` with `-d foo/bar` lands at `foo/bar/a/b/c`. A trailing slash is
+    /// By default only the renamed basename is placed in `<dir>` (flatten), so
+    /// `x.jpg` with `-d out` lands at `out/x.jpg`. A trailing slash is
     /// immaterial (`-d a/b` and `-d a/b/` behave identically). Missing parent
-    /// directories are created automatically (implies `--create-dirs`).
+    /// directories are created automatically (implies `--create-dirs`). Use
+    /// `--parents` to preserve the source's directory structure instead.
     #[arg(
         short = 'd',
         long = "directory",
@@ -279,6 +280,20 @@ struct Cli {
         env = "REN_DIRECTORY"
     )]
     directory: Option<PathBuf>,
+
+    /// Preserve the source's parent directories under `-d <dir>`.
+    ///
+    /// Reproduces each file's path *relative to its walk root* under `<dir>`
+    /// instead of flattening: a file found at `photos/2024/x.jpg` under root
+    /// `photos` lands at `out/2024/x.jpg` rather than `out/x.jpg`. Only
+    /// meaningful alongside `-d`, which it requires.
+    #[arg(
+        long = "parents",
+        requires = "directory",
+        env = "REN_PARENTS",
+        value_parser = BoolishValueParser::new()
+    )]
+    parents: bool,
 
     #[arg(long = "completions", value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
@@ -352,6 +367,7 @@ fn print_help() {
 {yellow}{bold}Output{reset}
 
   {red}-d{reset}, {red}--directory {dim}<dir>{reset}     Relocate renamed files under {red}<dir>{reset} {grey}(implies --create-dirs){reset}
+      {red}--parents{reset}             Keep source parent dirs under {red}-d{reset} {grey}(else flatten){reset}
       {red}--create-dirs{reset}         Create missing parent directories
 
 {yellow}{bold}Behavior{reset}
@@ -446,9 +462,13 @@ fn print_help_long() {
   {grey}# Move into new subdirectories, creating parents as needed{reset}
   {green}${reset} ren --create-dirs --regex '^(.*)\\.log$' 'logs/$1.log'
 
-  {grey}# Relocate matches under a base directory, creating parents as needed{reset}
-  {grey}#  (a/b/c.txt → out/a/b/c.txt; -d implies --create-dirs){reset}
+  {grey}# Relocate matches into a base directory, flattening by default{reset}
+  {grey}#  (a/b/c.txt → out/c.txt; -d implies --create-dirs){reset}
   {green}${reset} ren -R -d out foo bar
+
+  {grey}# ...or keep the source's directory structure with --parents{reset}
+  {grey}#  (a/b/c.txt → out/a/b/c.txt){reset}
+  {green}${reset} ren -R -d out --parents foo bar
 
   {grey}# Number all files: 01_foo.txt, 02_bar.txt, … (smart per-dir width){reset}
   {green}${reset} ren --prepend '{{N}}_'
@@ -787,6 +807,7 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
         "preview" => "REN_PREVIEW",
         "create_dirs" => "REN_CREATE_DIRS",
         "directory" => "REN_DIRECTORY",
+        "parents" => "REN_PARENTS",
         _ => return None,
     })
 }
@@ -1533,6 +1554,7 @@ fn run() -> Result<()> {
         cli.change_extension.as_deref(),
         &transforms_opts,
         cli.directory.as_deref(),
+        cli.parents,
     );
     validate_plan(&plan)?;
 
