@@ -18,7 +18,9 @@ use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use clap_complete::Shell;
 
 use crate::expressions::{CompileOptions, EXPR_SEP, compile_expressions};
-use crate::rename::{ExtensionScope, PlanEntry, apply_plan, build_plan, validate_plan};
+use crate::rename::{
+    ExtensionScope, PlanEntry, apply_plan_interruptible as apply_plan, build_plan, validate_plan,
+};
 
 #[derive(Parser)]
 #[command(name = "ren", version, disable_help_flag = true)]
@@ -1572,6 +1574,7 @@ fn run() -> Result<()> {
         if accepted.is_empty() {
             return Ok(());
         }
+        validate_plan(&accepted)?;
         if create_dirs {
             create_missing_parents(&accepted)?;
         }

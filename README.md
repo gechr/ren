@@ -145,4 +145,10 @@ By default the pipeline runs on the file stem only and the extension is reattach
 | `←` | go back and revise the previous decision  |
 | `→` | skip this rename                          |
 
-Accepted renames are applied immediately - `--preview` is its own mode and is mutually exclusive with `--dry-run`/`--write`.
+Accepted renames are applied after prompting finishes. The accepted subset is checked for collisions again, so rejecting a rename cannot allow another accepted rename to overwrite that file. `--preview` is its own mode and is mutually exclusive with `--dry-run`/`--write`.
+
+## Rename safety
+
+Renames use two stages within each depth group: sources move to temporary names, then to their destinations. A failure or interrupt in either stage attempts to restore that group. Deeper groups already applied remain renamed and are listed in the error. If recovery fails, the error reports where each stranded file remains. Ctrl-C and termination requests are checked between operations; forced termination and power loss cannot run recovery.
+
+Placement and recovery refuse to overwrite occupied paths, including destinations created after the initial checks. This requires native exclusive rename support on Linux, macOS, or Windows; other platforms fail safely. Filesystems that cannot provide the operation also fail. Cross-filesystem moves and durability after power loss are not supported guarantees.

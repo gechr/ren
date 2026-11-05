@@ -4,32 +4,32 @@
 // two-phase rename.
 //
 // The two-phase apply runs deepest-depth first. Each depth-group renames every
-// `old` to a unique `<parent>/<basename>.ren-<pid>-<counter>` temp (phase 1),
+// `old` to a unique `<parent>/.ren-<pid>-<counter>` temp (phase 1),
 // then renames every temp to its target `new` (phase 2). This handles chains,
 // cycles, case-only renames (which would otherwise no-op on case-insensitive
 // filesystems), and parent/child dependencies through the same mechanism.
 //
-// Rollback scope is per-failing-depth only: a phase-2 failure rolls back the
-// failing depth's already-applied phase-2 ops (in reverse) and then all
-// phase-1 temps (in reverse) to their `old`. Deeper depths stay applied. The
-// error message says so.
+// Rollback scope is per-failing-depth only: either failure restores staged
+// sources, undoing completed placements first. Deeper depths stay applied.
+// Recovery failures report the actual location of each stranded entry.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::{Context as _, Result};
 
 use crate::display_path;
 use crate::expressions;
 use crate::scan;
 use crate::transforms;
+
+mod noreplace;
 
 /// A single planned rename.
 ///
@@ -313,12 +313,31 @@ fn parent_key(path: &Path) -> PathBuf {
 ///    case-insensitively, which catches collisions on case-insensitive
 ///    filesystems like macOS APFS).
 /// 2. Existing target: a `new` that already exists on disk and is not the
-///    `old` of some entry in the plan (also case-insensitive).
+///    actual directory entry of an `old` scheduled to move.
 ///
 /// Case folding uses `String::to_lowercase`, which is approximate Unicode
 /// (see the trade-offs section of the build plan). Adequate for ASCII-only
 /// filenames.
 pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    for entry in plan {
+        let old = absolute_normalized(&cwd.join(&entry.old))?;
+        let new = absolute_normalized(&cwd.join(&entry.new))?;
+        if new != old
+            && new.starts_with(&old)
+            && entry
+                .old
+                .symlink_metadata()
+                .with_context(|| format!("unable to inspect source {}", display_path(&entry.old)))?
+                .is_dir()
+        {
+            return Err(anyhow!(
+                "cannot move directory {} inside itself: {}",
+                display_path(&entry.old),
+                display_path(&entry.new)
+            ));
+        }
+    }
     // 1. Within-plan duplicates: bucket entries by lowercased `new` and
     //    surface every group with more than one source path.
     let mut by_new: BTreeMap<String, Vec<&PlanEntry>> = BTreeMap::new();
@@ -348,21 +367,52 @@ pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
         return Err(anyhow!("{msg}"));
     }
 
-    // 2. Existing-target collisions: a `new` that exists on disk but isn't the
-    //    `old` of any entry in the plan. The lowercase set lets us match
-    //    case-insensitive filesystems where `tmp` and `TMP` resolve to the
-    //    same dirent.
-    let olds_lower: std::collections::HashSet<String> = plan
+    // Resolve actual directory entries, not lowercased spellings. On a
+    // case-sensitive volume, Foo and foo can be unrelated existing files.
+    let old_entries: std::collections::HashMap<PathBuf, (&Path, usize)> = plan
         .iter()
-        .map(|e| e.old.to_string_lossy().to_lowercase())
-        .collect();
+        .map(|e| {
+            existing_entry(&e.old)
+                .with_context(|| format!("unable to resolve source {}", display_path(&e.old)))
+                .map(|path| (path, (e.old.as_path(), e.depth)))
+        })
+        .collect::<Result<_>>()?;
+    let mut aliases = std::collections::HashMap::<_, Vec<_>>::new();
+    for (path, source) in &old_entries {
+        if let Some(key) = case_alias_key(path) {
+            aliases.entry(key).or_default().push(*source);
+        }
+    }
 
     let mut external: Vec<(&Path, &Path)> = Vec::new();
     for entry in plan {
-        if entry.new.symlink_metadata().is_ok() {
-            let new_lower = entry.new.to_string_lossy().to_lowercase();
-            if !olds_lower.contains(&new_lower) {
-                external.push((entry.old.as_path(), entry.new.as_path()));
+        match existing_entry(&entry.new) {
+            Ok(destination) => {
+                let mut freed = old_entries
+                    .get(&destination)
+                    .is_some_and(|(_, depth)| *depth >= entry.depth);
+                if !freed
+                    && let Some(candidates) =
+                        case_alias_key(&destination).and_then(|key| aliases.get(&key))
+                {
+                    let destination_id = entry_identity(&entry.new)?;
+                    for &(source, depth) in candidates {
+                        if depth >= entry.depth && entry_identity(source)? == destination_id {
+                            freed = true;
+                            break;
+                        }
+                    }
+                }
+                if !freed {
+                    external.push((entry.old.as_path(), entry.new.as_path()));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "unable to resolve destination {}",
+                    display_path(&entry.new)
+                )));
             }
         }
     }
@@ -378,32 +428,149 @@ pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
     Ok(())
 }
 
+fn case_alias_key(path: &Path) -> Option<(PathBuf, String)> {
+    Some((
+        path.parent()?.to_path_buf(),
+        path.file_name()?.to_str()?.to_lowercase(),
+    ))
+}
+
+fn entry_identity(path: &Path) -> Result<(u64, u64)> {
+    noreplace::entry_identity(path)
+        .with_context(|| format!("unable to inspect directory entry {}", display_path(path)))
+}
+
+fn absolute_normalized(path: &Path) -> io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn existing_entry(path: &Path) -> io::Result<PathBuf> {
+    let metadata = path.symlink_metadata()?;
+    if metadata.file_type().is_symlink() {
+        // Resolving the final symlink would confuse its target with the link.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(parent.canonicalize()?.join(
+            path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path has no basename")
+            })?,
+        ))
+    } else {
+        path.canonicalize()
+    }
+}
+
 /// Apply the plan via a per-depth two-phase rename, deepest-first.
 ///
 /// Group entries by `depth` and walk descending. For each depth: rename every
 /// `old` to a unique temp (phase 1), then rename every temp to its `new`
-/// (phase 2). On a phase-2 error, roll back the failing depth (and only the
-/// failing depth - deeper depths are already committed). On a phase-1 error,
-/// bubble the error: at the failure point only some entries are at temps and
-/// the remainder are still at `old`, so no rollback is required.
+/// (phase 2). On either error, roll back the failing depth. Deeper depths
+/// remain committed. Rollback never replaces an occupied path.
+#[cfg(test)]
 pub(crate) fn apply_plan(plan: &[PlanEntry]) -> Result<()> {
+    validate_plan(plan)?;
     apply_plan_with(plan, real_rename)
 }
 
-/// Real `fs::rename` adapter for the production apply path.
+pub(crate) fn apply_plan_interruptible(plan: &[PlanEntry]) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&cancelled);
+    let active = Arc::new(Mutex::new(true));
+    #[derive(Debug)]
+    struct ApplyGuard(Arc<Mutex<bool>>);
+    impl Drop for ApplyGuard {
+        fn drop(&mut self) {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        }
+    }
+    // The caller owns reporting. Keep cancellation in recovery mode until it
+    // has written/flushed the error and releases it, including errors naming
+    // stranded files. Printing remains outside the rename engine.
+    #[derive(Debug)]
+    struct ApplyFailure {
+        error: anyhow::Error,
+        _guard: ApplyGuard,
+    }
+    impl std::fmt::Display for ApplyFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.error)
+        }
+    }
+    impl std::error::Error for ApplyFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.error.source()
+        }
+    }
+    let guard = ApplyGuard(Arc::clone(&active));
+    ctrlc::set_handler(move || {
+        let applying = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *applying {
+            signal.store(true, Ordering::Relaxed);
+        } else {
+            // The handler outlives apply. Once recovery is finished, a signal
+            // must still terminate even when the main thread is blocked on output.
+            std::process::exit(130);
+        }
+    })?;
+    let result = (|| {
+        validate_plan(plan)?;
+        apply_plan_with_cancellation(plan, real_rename, || cancelled.load(Ordering::Relaxed))
+    })();
+    match result {
+        Ok(()) => {
+            drop(guard);
+            check_cancelled(&|| cancelled.load(Ordering::Relaxed)).map_err(anyhow::Error::from)
+        }
+        Err(error) => Err(anyhow::Error::new(ApplyFailure {
+            error,
+            _guard: guard,
+        })),
+    }
+}
+
+/// Native no-overwrite rename adapter for the production apply path.
 ///
 /// `apply_plan_with` takes the rename op as a parameter so tests can inject a
 /// fake to exercise the rollback branch deterministically.
 fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+    noreplace::rename(from, to)
 }
 
 /// Apply a plan using a caller-supplied rename op. The production entry point
-/// `apply_plan` wires this to `fs::rename`; tests inject a fake to drive the
+/// `apply_plan` wires this to `real_rename`; tests inject a fake to drive the
 /// phase-2 rollback path.
+#[cfg(test)]
 fn apply_plan_with<F>(plan: &[PlanEntry], rename_op: F) -> Result<()>
 where
     F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    apply_plan_with_cancellation(plan, rename_op, || false)
+}
+
+fn apply_plan_with_cancellation<F, C>(plan: &[PlanEntry], rename_op: F, cancelled: C) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+    C: Fn() -> bool,
 {
     // Group by depth. `BTreeMap` gives ordered iteration; `Vec` insertion order
     // within each group is preserved and matches `build_plan`'s output order
@@ -415,16 +582,55 @@ where
         by_depth.entry(entry.depth).or_default().push(entry);
     }
 
+    let mut completed: Vec<&PlanEntry> = Vec::new();
     for (_, group) in by_depth.iter().rev() {
-        apply_depth_group(group, &rename_op)?;
+        if let Err(error) = apply_depth_group_cancellable(group, &rename_op, &cancelled) {
+            if completed.is_empty() {
+                return Err(error);
+            }
+            let mut message = String::from("earlier depth groups remain applied:");
+            for entry in completed {
+                let _ = write!(
+                    message,
+                    "\n  {} → {}",
+                    display_path(&entry.old),
+                    display_path(&entry.new)
+                );
+            }
+            return Err(error.context(message));
+        }
+        completed.extend(group.iter().copied());
     }
 
     Ok(())
 }
 
 /// Apply a single depth-group: phase 1 (old → temp) then phase 2 (temp → new),
-/// with per-depth rollback on phase-2 failure.
+/// with per-depth rollback on either failure.
+#[cfg(test)]
 fn apply_depth_group<F>(group: &[&PlanEntry], rename_op: &F) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    apply_depth_group_cancellable(group, rename_op, &|| false)
+}
+
+fn check_cancelled(cancelled: &impl Fn() -> bool) -> io::Result<()> {
+    if cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "rename interrupted",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_depth_group_cancellable<F>(
+    group: &[&PlanEntry],
+    rename_op: &F,
+    cancelled: &impl Fn() -> bool,
+) -> Result<()>
 where
     F: Fn(&Path, &Path) -> io::Result<()>,
 {
@@ -438,7 +644,7 @@ where
         // is process-wide unique).
         let mut attempt = 0;
         loop {
-            match rename_op(&entry.old, &temp) {
+            match check_cancelled(cancelled).and_then(|()| rename_op(&entry.old, &temp)) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
                     attempt += 1;
@@ -448,11 +654,14 @@ where
                     // User-facing: the rename of `old` to `new` failed. The
                     // temp hop is an implementation detail; the user wrote a
                     // find/replace, they see "rename A → B".
-                    return Err(anyhow::Error::from(e).context(format!(
-                        "could not rename {} → {}",
-                        entry.old.display(),
-                        entry.new.display(),
-                    )));
+                    let recovery = rollback(&applied, &[], rename_op);
+                    return Err(anyhow::Error::from(e).context(
+                        format!(
+                            "could not rename {} → {}",
+                            entry.old.display(),
+                            entry.new.display(),
+                        ) + &recovery,
+                    ));
                 }
             }
         }
@@ -464,38 +673,15 @@ where
     // ops and then all phase-1 temps.
     let mut phase2_done: Vec<(&PlanEntry, PathBuf)> = Vec::with_capacity(applied.len());
     for (entry, temp) in &applied {
-        if let Err(e) = rename_op(temp, &entry.new) {
-            // Rollback: undo phase-2 successes in reverse, then phase-1 temps
-            // in reverse. Failures during rollback are warned but never mask
-            // the original phase-2 error.
-            //
-            // The two warning shapes differ because the file's stuck location
-            // does: a failed phase-2 undo leaves the file at `new` (already
-            // renamed), while a failed phase-1 undo leaves it at the internal
-            // temp path - which the user has to know about to recover it.
-            for (done_entry, done_temp) in phase2_done.iter().rev() {
-                if let Err(re) = rename_op(&done_entry.new, done_temp) {
-                    eprintln!(
-                        "warning: could not undo rename of {} → {}: {re}",
-                        done_entry.old.display(),
-                        done_entry.new.display(),
-                    );
-                }
-            }
-            for (a_entry, a_temp) in applied.iter().rev() {
-                if let Err(re) = rename_op(a_temp, &a_entry.old) {
-                    eprintln!(
-                        "warning: {} could not be restored and is currently at {}: {re}",
-                        a_entry.old.display(),
-                        a_temp.display(),
-                    );
-                }
-            }
-            return Err(anyhow::Error::from(e).context(format!(
-                "could not rename {} → {}",
-                entry.old.display(),
-                entry.new.display(),
-            )));
+        if let Err(e) = check_cancelled(cancelled).and_then(|()| rename_op(temp, &entry.new)) {
+            let recovery = rollback(&applied, &phase2_done, rename_op);
+            return Err(anyhow::Error::from(e).context(
+                format!(
+                    "could not rename {} → {}",
+                    entry.old.display(),
+                    entry.new.display(),
+                ) + &recovery,
+            ));
         }
         phase2_done.push((entry, temp.clone()));
     }
@@ -503,26 +689,54 @@ where
     Ok(())
 }
 
-/// Build a unique-looking temp path next to `old`. The pre-check is
-/// best-effort for human-readable temp names; `apply_depth_group` retries on
-/// `ErrorKind::AlreadyExists` from the actual rename to handle the race.
+fn rollback<F>(
+    staged: &[(&PlanEntry, PathBuf)],
+    placed: &[(&PlanEntry, PathBuf)],
+    rename_op: &F,
+) -> String
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    let mut recovery = String::new();
+    let mut stranded = std::collections::HashSet::new();
+    // Vacate every completed destination before restoring sources, so chains
+    // and cycles can be undone without overwriting another entry.
+    for (entry, temp) in placed.iter().rev() {
+        if let Err(error) = rename_op(&entry.new, temp) {
+            stranded.insert(temp);
+            let _ = write!(
+                recovery,
+                "\nrecovery required: {} remains at {} ({error})",
+                entry.old.display(),
+                entry.new.display()
+            );
+        }
+    }
+    for (entry, temp) in staged.iter().rev() {
+        if stranded.contains(temp) {
+            continue;
+        }
+        if let Err(error) = rename_op(temp, &entry.old) {
+            let _ = write!(
+                recovery,
+                "\nrecovery required: {} remains at {} ({error})",
+                entry.old.display(),
+                temp.display()
+            );
+        }
+    }
+    recovery
+}
+
+/// Build a bounded temp name next to `old`. The atomic rename reserves it;
+/// `apply_depth_group` retries collisions without overwriting the occupant.
 fn unique_temp_path(old: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let parent = old.parent().unwrap_or(Path::new("."));
-    let base = old
-        .file_name()
-        .expect("rename source must have a basename")
-        .to_string_lossy();
     let pid = std::process::id();
-
-    loop {
-        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!("{base}.ren-{pid}-{counter:08}"));
-        if candidate.symlink_metadata().is_err() {
-            return candidate;
-        }
-    }
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".ren-{pid}-{counter:08x}"))
 }
 
 #[cfg(test)]
@@ -545,6 +759,557 @@ mod tests {
     use crate::expressions;
     use crate::scan;
     use crate::transforms;
+
+    fn two_entry_plan(dir: &Path) -> Vec<PlanEntry> {
+        ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                fs::write(dir.join(name), name).unwrap();
+                PlanEntry {
+                    old: dir.join(name),
+                    new: dir.join(format!("new-{name}")),
+                    depth: 1,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancellation_during_staging_restores_sources() {
+        use std::cell::Cell;
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let cancelled = Cell::new(false);
+        let rename = |from: &Path, to: &Path| {
+            super::real_rename(from, to)?;
+            cancelled.set(true);
+            Ok(())
+        };
+        let error =
+            super::apply_plan_with_cancellation(&plan, rename, || cancelled.get()).unwrap_err();
+        assert!(format!("{error:#}").contains("rename interrupted"));
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cancellation_during_placement_restores_sources() {
+        use std::cell::Cell;
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let cancelled = Cell::new(false);
+        let rename = |from: &Path, to: &Path| {
+            super::real_rename(from, to)?;
+            if to == plan[0].new {
+                cancelled.set(true);
+            }
+            Ok(())
+        };
+        assert!(super::apply_plan_with_cancellation(&plan, rename, || cancelled.get()).is_err());
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failure_reports_earlier_completed_depth_groups() {
+        let dir = TempDir::new().unwrap();
+        let mut plan = two_entry_plan(dir.path());
+        plan[0].depth = 2;
+        let rename = |from: &Path, to: &Path| {
+            if from == plan[1].old {
+                Err(io::Error::other("injected failure"))
+            } else {
+                super::real_rename(from, to)
+            }
+        };
+        let error = super::apply_plan_with(&plan, rename).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("earlier depth groups remain applied"));
+        assert!(message.contains(&format!(
+            "{} → {}",
+            plan[0].old.display(),
+            plan[0].new.display()
+        )));
+        assert_eq!(fs::read_to_string(&plan[0].new).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+    }
+
+    #[test]
+    fn target_in_later_depth_group_is_not_yet_vacant() {
+        let dir = TempDir::new().unwrap();
+        let mut plan = two_entry_plan(dir.path());
+        plan[0].depth = 2;
+        plan[0].new = plan[1].old.clone();
+        assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn directory_cannot_move_inside_its_descendant() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("folder");
+        fs::create_dir(&old).unwrap();
+        let plan = [PlanEntry {
+            old: old.clone(),
+            new: old.join("child"),
+            depth: 1,
+        }];
+        assert!(
+            validate_plan(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("inside itself")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn case_only_symlink_rename_preserves_link_identity() {
+        for target_exists in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let target = dir.path().join("target.txt");
+            if target_exists {
+                fs::write(&target, "target").unwrap();
+            }
+            let old = dir.path().join("Link.txt");
+            let new = dir.path().join("link.txt");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("target.txt", &old).unwrap();
+            #[cfg(windows)]
+            if let Err(error) = std::os::windows::fs::symlink_file("target.txt", &old) {
+                if error.raw_os_error() == Some(1314) {
+                    return;
+                }
+                panic!("unable to create test symlink: {error}");
+            }
+            apply_plan(&[PlanEntry {
+                old,
+                new: new.clone(),
+                depth: 1,
+            }])
+            .unwrap();
+            assert_eq!(fs::read_link(&new).unwrap(), PathBuf::from("target.txt"));
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(names.contains(&std::ffi::OsString::from("link.txt")));
+            assert!(!names.contains(&std::ffi::OsString::from("Link.txt")));
+            assert_eq!(target.exists(), target_exists);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_directory_is_not_a_self_descendant_move() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+        let old = dir.path().join("link");
+        std::os::unix::fs::symlink("target", &old).unwrap();
+        let plan = [PlanEntry {
+            new: old.join("child"),
+            old: old.clone(),
+            depth: 1,
+        }];
+        validate_plan(&plan).unwrap();
+        assert!(apply_plan(&plan).is_err());
+        assert_eq!(fs::read_link(old).unwrap(), PathBuf::from("target"));
+    }
+
+    #[test]
+    fn metadata_errors_identify_the_affected_path() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("source");
+        let new = dir.path().join("z".repeat(300));
+        fs::write(&old, "content").unwrap();
+        let error = validate_plan(&[PlanEntry {
+            old: old.clone(),
+            new: new.clone(),
+            depth: 1,
+        }])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&new.to_string_lossy().to_string())
+        );
+        fs::remove_file(&old).unwrap();
+        let error = validate_plan(&[PlanEntry {
+            old: old.clone(),
+            new: dir.path().join("new"),
+            depth: 1,
+        }])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&old.to_string_lossy().to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_after_apply_child() {
+        use std::io::Write as _;
+        let Some(root) = std::env::var_os("REN_SIGNAL_TEST_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(root);
+        let expect_error = dir.join("expect-error").exists();
+        let result = super::apply_plan_interruptible(&[PlanEntry {
+            old: dir.join("source"),
+            new: dir.join(if expect_error {
+                "destination/child"
+            } else {
+                "destination"
+            }),
+            depth: 1,
+        }]);
+        if expect_error {
+            let error = result.unwrap_err();
+            fs::write(dir.join("completed"), "").unwrap();
+            let started = std::time::Instant::now();
+            while !dir.join("report-now").exists() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            writeln!(std::io::stderr(), "{error:#}").unwrap();
+            std::io::stderr().flush().unwrap();
+            drop(error);
+            fs::write(dir.join("reported"), "").unwrap();
+        } else {
+            result.unwrap();
+            fs::write(dir.join("completed"), "").unwrap();
+        }
+        std::io::stdout()
+            .lock()
+            .write_all(&vec![b'x'; 1024 * 1024])
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_after_apply_terminates_blocked_output() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("source"), "content").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rename::tests::signal_after_apply_child",
+                "--nocapture",
+            ])
+            .env("REN_SIGNAL_TEST_DIR", dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !dir.path().join("completed").exists() && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !dir.path().join("completed").exists() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("child did not finish apply");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(signal.success());
+        let signalled = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if signalled.elapsed() >= Duration::from_secs(3) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(status.and_then(|status| status.code()), Some(130));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("destination")).unwrap(),
+            "content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_error_keeps_signal_protection_until_reported() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("source"), "source").unwrap();
+        fs::write(dir.path().join("destination"), "occupied").unwrap();
+        fs::write(dir.path().join("expect-error"), "").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rename::tests::signal_after_apply_child",
+                "--nocapture",
+            ])
+            .env("REN_SIGNAL_TEST_DIR", dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !dir.path().join("completed").exists() && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !dir.path().join("completed").exists() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("child did not return an apply error");
+        }
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "signal discarded the pending error"
+        );
+        fs::write(dir.path().join("report-now"), "").unwrap();
+        let started = Instant::now();
+        while !dir.path().join("reported").exists() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !dir.path().join("reported").exists() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("child did not flush its apply error");
+        }
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(status.and_then(|status| status.code()), Some(130));
+        let output = child.wait_with_output().unwrap();
+        let report = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(report.matches("unable to resolve destination").count(), 1);
+        assert_eq!(report.matches("os error").count(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("source")).unwrap(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn unicode_alias_collision_rolls_back_without_overwriting() {
+        let dir = TempDir::new().unwrap();
+        let nfc = dir.path().join("é");
+        let nfd = dir.path().join("e\u{301}");
+        fs::write(&nfc, "probe").unwrap();
+        let aliases = nfd.exists();
+        fs::remove_file(&nfc).unwrap();
+        if !aliases {
+            return;
+        }
+        let mut plan = two_entry_plan(dir.path());
+        plan[0].new = nfc;
+        plan[1].new = nfd;
+        assert!(apply_plan(&plan).is_err());
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+    }
+
+    #[test]
+    fn applying_preview_subset_cannot_overwrite_rejected_source() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let aa = dir.path().join("aa");
+        fs::write(&a, "first").unwrap();
+        fs::write(&aa, "second").unwrap();
+        let plan = vec![
+            PlanEntry {
+                old: a.clone(),
+                new: aa.clone(),
+                depth: 1,
+            },
+            PlanEntry {
+                old: aa.clone(),
+                new: dir.path().join("aaaa"),
+                depth: 1,
+            },
+        ];
+        validate_plan(&plan).unwrap();
+        assert!(apply_plan(&plan[..1]).is_err());
+        assert_eq!(fs::read_to_string(a).unwrap(), "first");
+        assert_eq!(fs::read_to_string(aa).unwrap(), "second");
+    }
+
+    #[test]
+    fn staging_failure_restores_earlier_sources() {
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let rename = |from: &Path, to: &Path| {
+            if from == plan[1].old {
+                Err(io::Error::other("staging failed"))
+            } else {
+                super::real_rename(from, to)
+            }
+        };
+        assert!(super::apply_plan_with(&plan, rename).is_err());
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_destination_is_preserved_and_sources_restored() {
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let rename = |from: &Path, to: &Path| {
+            if to == plan[1].new {
+                fs::write(to, "concurrent").unwrap();
+            }
+            super::real_rename(from, to)
+        };
+        assert!(super::apply_plan_with(&plan, rename).is_err());
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+        assert_eq!(fs::read_to_string(&plan[1].new).unwrap(), "concurrent");
+        assert!(!plan[0].new.exists());
+    }
+
+    #[test]
+    fn rollback_preserves_occupied_source_and_reports_temp_location() {
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let rename = |from: &Path, to: &Path| {
+            if from == plan[1].old {
+                fs::write(&plan[0].old, "concurrent").unwrap();
+                Err(io::Error::other("staging failed"))
+            } else {
+                super::real_rename(from, to)
+            }
+        };
+        let error = super::apply_plan_with(&plan, rename)
+            .unwrap_err()
+            .to_string();
+        let stranded = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".ren-")
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(&plan[0].old).unwrap(), "concurrent");
+        assert_eq!(fs::read_to_string(&stranded).unwrap(), "a");
+        assert!(error.contains(&format!("remains at {}", stranded.display())));
+    }
+
+    #[test]
+    fn failed_placement_undo_reports_destination_not_temp() {
+        let dir = TempDir::new().unwrap();
+        let plan = two_entry_plan(dir.path());
+        let rename = |from: &Path, to: &Path| {
+            if to == plan[1].new || from == plan[0].new {
+                Err(io::Error::other("injected failure"))
+            } else {
+                super::real_rename(from, to)
+            }
+        };
+        let error = super::apply_plan_with(&plan, rename)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(fs::read_to_string(&plan[0].new).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&plan[1].old).unwrap(), "b");
+        assert!(error.contains(&format!("remains at {}", plan[0].new.display())));
+        assert_eq!(error.matches("recovery required:").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_basename_uses_bounded_temporary_name() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("z".repeat(249));
+        let new = dir.path().join("x".repeat(250));
+        fs::write(&old, "content").unwrap();
+        apply_plan(&[PlanEntry {
+            old: old.clone(),
+            new: new.clone(),
+            depth: 1,
+        }])
+        .unwrap();
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(new).unwrap(), "content");
+    }
+
+    #[test]
+    fn hardlink_target_is_not_a_scheduled_source_entry() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, "content").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        assert!(
+            validate_plan(&[PlanEntry {
+                old: a,
+                new: b,
+                depth: 1
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_fold_does_not_admit_unrelated_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let upper = dir.path().join("A");
+        fs::write(&a, "first").unwrap();
+        if upper.exists() {
+            return;
+        } // This distinction requires a case-sensitive volume.
+        fs::write(&upper, "second").unwrap();
+        assert!(
+            validate_plan(&[PlanEntry {
+                old: a,
+                new: upper,
+                depth: 1
+            }])
+            .is_err()
+        );
+    }
 
     /// Build compiled expressions from a literal find/replace.
     fn compile(find: &str, replace: &str) -> Vec<expressions::CompiledExpression> {

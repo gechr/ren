@@ -12,6 +12,7 @@ anyhow = "1.0"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 crossterm = "0.29"
+ctrlc = { version = "3.5", features = ["termination"] }
 ignore = "0.4"
 Inflector = "0.11"
 natord = "1.0"
@@ -25,6 +26,12 @@ toml = "1"
 # Windows `with_commas` falls back to the static English locale.
 [target.'cfg(not(windows))'.dependencies]
 num-format = { version = "0.4", features = ["with-system-locale"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Security"] }
 
 [dev-dependencies]
 assert_cmd = "2"
