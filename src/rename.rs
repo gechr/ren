@@ -27,17 +27,15 @@ use anyhow::{Context as _, Result};
 use crate::display_path;
 use crate::expressions;
 use crate::scan;
+use crate::scan::existing_entry;
 use crate::transforms;
 
 mod noreplace;
 
 /// A single planned rename.
 ///
-/// `depth` is the path's component count **relative to the walk root** it was
-/// found under (computed in `build_plan` via `strip_prefix(root)`). Carrying it
-/// here avoids recomputation in `apply_plan` and keeps multi-root walks correct
-/// (a file two levels deep under root `a` and a file two levels deep under root
-/// `b` are both depth 2, regardless of absolute component counts).
+/// `depth` is the absolute component count resolved during discovery, keeping
+/// descendants before parents even when their originating roots differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanEntry {
     pub old: PathBuf,
@@ -181,7 +179,11 @@ pub(crate) fn build_plan(
             );
             continue;
         };
-        let parent = parent_key(&record.path);
+        let parent = if uses_counter {
+            parent_key(&record.path)
+        } else {
+            PathBuf::new()
+        };
 
         // The pipeline (find/replace + transforms) runs on `working_input`,
         // and the result is reassembled as `prefix + after_transforms + suffix`.
@@ -284,11 +286,7 @@ pub(crate) fn build_plan(
                 .unwrap_or_else(|| PathBuf::from(&new_basename)),
         };
 
-        let depth = record
-            .path
-            .strip_prefix(&record.root)
-            .map(|p| p.components().count())
-            .unwrap_or_else(|_| record.path.components().count());
+        let depth = record.depth;
 
         plan.push(PlanEntry {
             old: record.path.clone(),
@@ -304,7 +302,13 @@ pub(crate) fn build_plan(
 }
 
 fn parent_key(path: &Path) -> PathBuf {
-    path.parent().map(Path::to_path_buf).unwrap_or_default()
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
 }
 
 /// Validate the plan against two classes of conflict:
@@ -369,26 +373,38 @@ pub(crate) fn validate_plan(plan: &[PlanEntry]) -> Result<()> {
 
     // Resolve actual directory entries, not lowercased spellings. On a
     // case-sensitive volume, Foo and foo can be unrelated existing files.
-    let old_entries: std::collections::HashMap<PathBuf, (&Path, usize)> = plan
-        .iter()
-        .map(|e| {
-            existing_entry(&e.old)
-                .with_context(|| format!("unable to resolve source {}", display_path(&e.old)))
-                .map(|path| (path, (e.old.as_path(), e.depth)))
-        })
-        .collect::<Result<_>>()?;
+    // Most runs have no occupied destinations, so resolve sources lazily.
+    let mut old_entries: Option<std::collections::HashMap<PathBuf, (&Path, usize)>> = None;
     let mut aliases = std::collections::HashMap::<_, Vec<_>>::new();
-    for (path, source) in &old_entries {
-        if let Some(key) = case_alias_key(path) {
-            aliases.entry(key).or_default().push(*source);
-        }
-    }
 
     let mut external: Vec<(&Path, &Path)> = Vec::new();
     for entry in plan {
         match existing_entry(&entry.new) {
             Ok(destination) => {
+                if old_entries.is_none() {
+                    let sources: std::collections::HashMap<_, _> = plan
+                        .iter()
+                        .map(|source| {
+                            existing_entry(&source.old)
+                                .with_context(|| {
+                                    format!(
+                                        "unable to resolve source {}",
+                                        display_path(&source.old)
+                                    )
+                                })
+                                .map(|path| (path, (source.old.as_path(), source.depth)))
+                        })
+                        .collect::<Result<_>>()?;
+                    for (path, source) in &sources {
+                        if let Some(key) = case_alias_key(path) {
+                            aliases.entry(key).or_default().push(*source);
+                        }
+                    }
+                    old_entries = Some(sources);
+                }
                 let mut freed = old_entries
+                    .as_ref()
+                    .expect("source entries initialized")
                     .get(&destination)
                     .is_some_and(|(_, depth)| *depth >= entry.depth);
                 if !freed
@@ -452,24 +468,6 @@ fn absolute_normalized(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(normalized)
-}
-
-fn existing_entry(path: &Path) -> io::Result<PathBuf> {
-    let metadata = path.symlink_metadata()?;
-    if metadata.file_type().is_symlink() {
-        // Resolving the final symlink would confuse its target with the link.
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        Ok(parent.canonicalize()?.join(
-            path.file_name().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "path has no basename")
-            })?,
-        ))
-    } else {
-        path.canonicalize()
-    }
 }
 
 /// Apply the plan via a per-depth two-phase rename, deepest-first.
@@ -935,6 +933,7 @@ mod tests {
                 .contains(&new.to_string_lossy().to_string())
         );
         fs::remove_file(&old).unwrap();
+        fs::write(dir.path().join("new"), "occupied").unwrap();
         let error = validate_plan(&[PlanEntry {
             old: old.clone(),
             new: dir.path().join("new"),
@@ -1329,7 +1328,8 @@ mod tests {
 
     /// Build a `PathRecord` rooted at `root`.
     fn record(path: PathBuf, root: PathBuf) -> scan::PathRecord {
-        scan::PathRecord { path, root }
+        let depth = std::path::absolute(&path).unwrap().components().count();
+        scan::PathRecord { path, root, depth }
     }
 
     // ---- end-to-end apply -------------------------------------------------
@@ -1594,7 +1594,7 @@ mod tests {
     // ---- depth derivation -------------------------------------------------
 
     #[test]
-    fn build_plan_derives_depth_relative_to_root() {
+    fn build_plan_retains_absolute_ancestry_depth() {
         let tmp = TempDir::new().unwrap();
         let nested = tmp.path().join("a").join("b").join("c.txt");
         fs::create_dir_all(nested.parent().unwrap()).unwrap();
@@ -1613,8 +1613,13 @@ mod tests {
         );
 
         assert_eq!(plan.len(), 1);
-        // a/b/c.txt under tmp/ → depth 3 relative to root.
-        assert_eq!(plan[0].depth, 3);
+        assert_eq!(
+            plan[0].depth,
+            std::path::absolute(&plan[0].old)
+                .unwrap()
+                .components()
+                .count()
+        );
     }
 
     // ---- target directory (`-d`) -----------------------------------------

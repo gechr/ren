@@ -29,15 +29,19 @@ pub(crate) struct FileSet {
 
 /// A walked path tagged with the root it was found under.
 ///
-/// Phase 3 uses `root` to compute the path's depth relative to the originating
-/// walk root via `path.strip_prefix(root)`, which keeps multi-root walks
-/// correct (a file two levels deep under root `a` and a file two levels deep
-/// under root `b` are both depth 2, regardless of their absolute component
-/// counts).
+/// `root` preserves the first originating root for `--parents`. `depth` uses
+/// absolute filesystem ancestry so parents sort after children across roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathRecord {
     pub(crate) path: PathBuf,
     pub(crate) root: PathBuf,
+    pub(crate) depth: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct Discovery {
+    pub(crate) records: Vec<PathRecord>,
+    pub(crate) errors: Vec<Error>,
 }
 
 /// Build a `WalkBuilder` configured with the supplied roots and (optional)
@@ -48,7 +52,7 @@ pub(crate) struct PathRecord {
 /// link itself, not its target, and dangling symlinks should still surface
 /// rather than being silently skipped.
 pub(crate) fn walk_builder(
-    dirs: Vec<&str>,
+    dirs: Vec<&Path>,
     file_set: Option<FileSet>,
     recursive: bool,
 ) -> Result<WalkBuilder> {
@@ -90,14 +94,16 @@ pub(crate) fn apply_walk_flags(builder: &mut WalkBuilder, hidden: bool, no_ignor
             .git_ignore(false)
             .git_exclude(false)
             .git_global(false);
-    } else {
-        builder.filter_entry(|entry| !is_vcs_path(entry.path()));
     }
+    builder.filter_entry(|entry| !is_vcs_path(entry.path()));
 }
 
 pub(crate) fn is_candidate_path(path: &Path) -> bool {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    !bytes.ends_with(b"~") && !bytes.ends_with(b"tags") && !bytes.ends_with(b"TAGS")
+    !path.as_os_str().as_encoded_bytes().ends_with(b"~")
+        && !matches!(
+            path.file_name().map(OsStr::as_encoded_bytes),
+            Some(b"tags" | b"TAGS")
+        )
 }
 
 fn is_vcs_path(path: &Path) -> bool {
@@ -164,35 +170,55 @@ pub(crate) fn parse_file_globs(input: &str) -> Vec<String> {
 /// per-depth grouping so temp-name allocation and rollback ordering are
 /// reproducible across runs.
 pub(crate) fn walk_paths(
-    dirs: Vec<&str>,
+    dirs: Vec<&Path>,
     file_set: Option<FileSet>,
     hidden: bool,
     no_ignore: bool,
     recursive: bool,
     include_dirs: bool,
-) -> Vec<PathRecord> {
-    let mut records: Vec<PathRecord> = Vec::new();
-
+) -> Discovery {
+    let mut found = Discovery::default();
+    let deduplicate = dirs.len() > 1;
+    let mut roots = Vec::with_capacity(dirs.len());
+    // Validate every explicit root before walking any of them. Transform
+    // defaults can make positionals paths, so one invalid root must never
+    // allow another root to produce a partially applied command.
     for dir in dirs {
+        match dir.canonicalize() {
+            Ok(path) => roots.push((dir, path.components().count())),
+            Err(error) => found
+                .errors
+                .push(Error::new(error).context(format!("Unable to resolve {}", dir.display()))),
+        }
+    }
+    if !found.errors.is_empty() {
+        return found;
+    }
+
+    for (dir, root_depth) in roots {
         let mut builder = match walk_builder(vec![dir], file_set.clone(), recursive) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("Warning: {dir}: {e}");
+                found
+                    .errors
+                    .push(e.context(format!("Unable to walk {}", dir.display())));
                 continue;
             }
         };
         apply_walk_flags(&mut builder, hidden, no_ignore);
-
         for result in builder.build() {
             let dirent = match result {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("Warning: {e}");
+                    found.errors.push(e.into());
                     continue;
                 }
             };
+            if let Some(error) = dirent.error() {
+                eprintln!("Warning: {error}");
+            }
             let path = dirent.path();
-            if !is_candidate_path(path) {
+            if dirent.depth() > 0 && !is_candidate_path(path) {
                 continue;
             }
             let admit = match dirent.file_type() {
@@ -206,15 +232,60 @@ pub(crate) fn walk_paths(
             if !admit {
                 continue;
             }
-            records.push(PathRecord {
+            found.records.push(PathRecord {
                 path: path.to_path_buf(),
                 root: PathBuf::from(dir),
+                depth: root_depth + dirent.depth(),
             });
         }
     }
 
-    records.sort_by(|a, b| natord::compare(&a.path.to_string_lossy(), &b.path.to_string_lossy()));
-    records
+    finish_discovery(&mut found, deduplicate);
+    found
+}
+
+pub(crate) fn finish_discovery(found: &mut Discovery, deduplicate: bool) {
+    if deduplicate {
+        let mut seen = std::collections::HashSet::new();
+        found
+            .records
+            .retain_mut(|record| match existing_entry(&record.path) {
+                Ok(key) => {
+                    record.depth = key.components().count();
+                    seen.insert(key)
+                }
+                Err(error) => {
+                    found.errors.push(
+                        Error::new(error)
+                            .context(format!("Unable to resolve {}", record.path.display())),
+                    );
+                    false
+                }
+            });
+    }
+    let mut keyed: Vec<_> = std::mem::take(&mut found.records)
+        .into_iter()
+        .map(|record| (record.path.to_string_lossy().into_owned(), record))
+        .collect();
+    keyed.sort_unstable_by(|(a, ar), (b, br)| {
+        natord::compare(a, b).then_with(|| ar.path.cmp(&br.path))
+    });
+    found.records = keyed.into_iter().map(|(_, record)| record).collect();
+}
+
+pub(crate) fn existing_entry(path: &Path) -> std::io::Result<PathBuf> {
+    let metadata = path.symlink_metadata()?;
+    if metadata.file_type().is_symlink() {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(parent.canonicalize()?.join(path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no basename")
+        })?))
+    } else {
+        path.canonicalize()
+    }
 }
 
 #[cfg(test)]
@@ -229,7 +300,25 @@ mod tests {
     use super::is_candidate_path;
     use super::is_vcs_path;
     use super::parse_file_globs;
-    use super::walk_paths;
+    fn walk_paths(
+        dirs: Vec<&str>,
+        file_set: Option<FileSet>,
+        hidden: bool,
+        no_ignore: bool,
+        recursive: bool,
+        include_dirs: bool,
+    ) -> Vec<super::PathRecord> {
+        let found = super::walk_paths(
+            dirs.into_iter().map(Path::new).collect(),
+            file_set,
+            hidden,
+            no_ignore,
+            recursive,
+            include_dirs,
+        );
+        assert!(found.errors.is_empty());
+        found.records
+    }
 
     // ---- is_candidate_path / is_vcs_path (lifted from rep) -------------
 

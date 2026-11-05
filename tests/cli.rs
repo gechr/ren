@@ -582,3 +582,219 @@ fn null_with_explicit_paths_errors() {
         .failure()
         .stderr(predicate::str::contains("--null"));
 }
+
+#[test]
+fn missing_explicit_roots_abort_but_stdin_continues_valid_inputs() {
+    for stdin in [false, true] {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("foo.txt"), "content").unwrap();
+        if stdin {
+            ren_stdin(&dir)
+                .args(["-W", "foo", "bar"])
+                .write_stdin("missing.txt\nfoo.txt\n")
+                .assert()
+                .failure();
+        } else {
+            ren(&dir)
+                .args(["-W", "foo", "bar", "missing.txt", "foo.txt"])
+                .assert()
+                .failure();
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join(if stdin { "bar.txt" } else { "foo.txt" })).unwrap(),
+            "content"
+        );
+        assert!(
+            !dir.path()
+                .join(if stdin { "foo.txt" } else { "bar.txt" })
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn transform_defaults_with_invalid_roots_cannot_modify_other_roots() {
+    for from_config in [false, true] {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Foo.txt"), "first").unwrap();
+        fs::write(dir.path().join("Other.TXT"), "second").unwrap();
+        let mut command = ren(&dir);
+        if from_config {
+            let config = dir.path().join("defaults.toml");
+            fs::write(&config, "lower = true\nwrite = true\n").unwrap();
+            command.env("REN_CONFIG_PATH", config);
+        } else {
+            command.env("REN_PREPEND", "x");
+        }
+        command
+            .args(["-W", "Foo", "Q", "."])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Unable to resolve Foo"));
+        let names = read_dir_basenames(dir.path());
+        assert!(names.contains("Foo.txt"));
+        assert!(names.contains("Other.TXT"));
+        assert_eq!(names.len(), if from_config { 3 } else { 2 });
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Foo.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Other.TXT")).unwrap(),
+            "second"
+        );
+    }
+}
+
+#[test]
+fn overlapping_roots_keep_first_root_and_number_each_entry_once() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("sub/nested")).unwrap();
+    fs::write(dir.path().join("sub/nested/a.txt"), "a").unwrap();
+    ren(&dir)
+        .args([
+            "-W",
+            "-R",
+            "--parents",
+            "-d",
+            "out",
+            "--prepend",
+            "{n}",
+            "sub",
+            "./sub/nested",
+            "sub/nested/a.txt",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out/nested/1a.txt")).unwrap(),
+        "a"
+    );
+}
+
+#[test]
+fn stdin_parent_and_child_apply_in_ancestry_order() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("d")).unwrap();
+    fs::write(dir.path().join("d/dx.txt"), "content").unwrap();
+    ren_stdin(&dir)
+        .args(["-W", "d", "e"])
+        .write_stdin("d\nd/dx.txt\n")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("e/ex.txt")).unwrap(),
+        "content"
+    );
+}
+
+#[test]
+fn candidate_exclusions_are_exact_and_explicit_files_are_honored() {
+    let dir = TempDir::new().unwrap();
+    for name in ["tags", "TAGS", "mytags", "backup~"] {
+        fs::write(dir.path().join(name), "content").unwrap();
+    }
+    ren(&dir)
+        .args(["-W", "--prepend", "x", "."])
+        .assert()
+        .success();
+    assert!(dir.path().join("xmytags").exists());
+    for name in ["tags", "TAGS", "backup~"] {
+        fs::write(dir.path().join(name), "content").unwrap();
+        ren(&dir)
+            .args(["-W", "--prepend", "x", name])
+            .assert()
+            .success();
+        assert!(dir.path().join(format!("x{name}")).exists());
+        fs::remove_file(dir.path().join(format!("x{name}"))).unwrap();
+    }
+}
+
+#[test]
+fn no_ignore_does_not_admit_vcs_metadata() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".git/HEAD"), "content").unwrap();
+    ren(&dir)
+        .args(["-W", "-H", "-R", "--no-ignore", "--prepend", "x", "."])
+        .assert()
+        .success();
+    assert!(dir.path().join(".git/HEAD").exists());
+}
+
+#[test]
+fn expression_preprocessing_respects_argument_terminator() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("-Example"), "content").unwrap();
+    ren(&dir)
+        .args(["-W", "--lower", "--", "-Example"])
+        .assert()
+        .success();
+    assert!(dir.path().join("-example").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn aliases_deduplicate_but_distinct_hardlinks_remain() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("real")).unwrap();
+    fs::write(dir.path().join("real/a.txt"), "content").unwrap();
+    fs::hard_link(dir.path().join("real/a.txt"), dir.path().join("real/b.txt")).unwrap();
+    std::os::unix::fs::symlink("real", dir.path().join("alias")).unwrap();
+    ren(&dir)
+        .args([
+            "-W",
+            "--prepend",
+            "{n}",
+            "real/a.txt",
+            "alias/a.txt",
+            "alias/b.txt",
+        ])
+        .assert()
+        .success();
+    // The retained alias/b path sorts before real/a, but both share a counter.
+    assert!(dir.path().join("real/2a.txt").exists());
+    assert!(dir.path().join("real/1b.txt").exists());
+}
+
+#[test]
+fn malformed_ignore_warns_without_failing_valid_renames() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join(".ignore"), "{a,b\n").unwrap();
+    fs::write(dir.path().join("foo.txt"), "content").unwrap();
+    ren(&dir)
+        .args(["-W", "foo", "bar", "."])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Warning:"));
+    assert!(dir.path().join("bar.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_utf8_pattern_is_an_error_without_panicking() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = TempDir::new().unwrap();
+    ren(&dir)
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .args(["x", "."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("find pattern must be valid UTF-8"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_parent_path_survives_argument_parsing() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path().join(std::ffi::OsStr::from_bytes(b"dir\xff"));
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("Foo.txt"), "content").unwrap();
+    ren(&dir)
+        .args(["-W", "--lower"])
+        .arg(parent.join("Foo.txt"))
+        .assert()
+        .success();
+    assert!(parent.join("foo.txt").exists());
+}

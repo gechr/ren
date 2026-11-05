@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::scan::PathRecord;
+use crate::scan::{Discovery, PathRecord, finish_discovery};
 
 /// True when stdin is a pipe or redirected regular file. TTY, `/dev/null`,
 /// and sockets all return false - `is_terminal()` alone can't distinguish a
@@ -66,20 +66,28 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// `PathRecord`s for caller-supplied paths. `root` is the parent so each
-/// entry registers as depth-1 - the user picked the file set, we don't
-/// reinterpret it as a tree. Non-existent paths are dropped.
-pub(crate) fn records_from_paths(paths: Vec<PathBuf>) -> Vec<PathRecord> {
-    paths
+/// Preserve the caller's entries without traversing directories. Deduplicate
+/// aliases, resolve actual depths, and retain errors for missing inputs.
+pub(crate) fn records_from_paths(paths: Vec<PathBuf>) -> Discovery {
+    let records = paths
         .into_iter()
-        .filter(|p| p.exists())
         .map(|p| {
             let root = p
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            PathRecord { path: p, root }
+            PathRecord {
+                path: p,
+                root,
+                depth: 0,
+            }
         })
-        .collect()
+        .collect();
+    let mut found = Discovery {
+        records,
+        errors: Vec::new(),
+    };
+    finish_discovery(&mut found, true);
+    found
 }

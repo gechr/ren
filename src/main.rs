@@ -8,7 +8,9 @@ mod scan;
 mod test_env;
 mod transforms;
 
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
@@ -26,7 +28,7 @@ use crate::rename::{
 #[command(name = "ren", version, disable_help_flag = true)]
 struct Cli {
     #[arg(value_name = "arg")]
-    args: Vec<String>,
+    args: Vec<OsString>,
 
     #[arg(short = 'h', help = "Print help")]
     help: bool,
@@ -552,12 +554,12 @@ impl Cli {
         }
     }
 
-    fn dirs(&self) -> Vec<&str> {
+    fn dirs(&self) -> Vec<&Path> {
         let args = &self.args[self.positional_skip()..];
         if args.is_empty() {
-            vec!["."]
+            vec![Path::new(".")]
         } else {
-            args.iter().map(|arg| arg.as_str()).collect()
+            args.iter().map(Path::new).collect()
         }
     }
 
@@ -584,11 +586,11 @@ impl Cli {
             .collect()
     }
 
-    fn pattern(&self) -> &str {
+    fn pattern(&self) -> &OsStr {
         &self.args[0]
     }
 
-    fn replacement(&self) -> &str {
+    fn replacement(&self) -> &OsStr {
         &self.args[1]
     }
 }
@@ -817,10 +819,15 @@ fn arg_env_name(id: &str) -> Option<&'static str> {
 /// Preprocess argv so that `-e <find> <replace>` is compacted into a single
 /// clap value joined by `EXPR_SEP` before clap parses the argument list.
 /// This lets the second arg start with `-` without being treated as a flag.
-pub(crate) fn preprocess_expression_args(args: Vec<String>) -> Vec<String> {
+pub(crate) fn preprocess_expression_args(args: Vec<OsString>) -> Vec<OsString> {
     let mut out = Vec::with_capacity(args.len());
     let mut iter = args.into_iter().peekable();
     while let Some(arg) = iter.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(iter);
+            break;
+        }
         if arg == "-e" || arg == "--expression" {
             out.push(arg);
             let Some(find) = iter.next() else { continue };
@@ -828,15 +835,25 @@ pub(crate) fn preprocess_expression_args(args: Vec<String>) -> Vec<String> {
                 out.push(find);
                 continue;
             };
-            out.push(format!("{find}{EXPR_SEP}{replace}"));
-        } else if let Some(find) = arg.strip_prefix("-e").filter(|s| !s.is_empty()) {
+            let mut pair = find;
+            pair.push(EXPR_SEP.to_string());
+            pair.push(replace);
+            out.push(pair);
+        } else if let Some(find) = arg
+            .to_str()
+            .and_then(|s| s.strip_prefix("-e"))
+            .filter(|s| !s.is_empty())
+        {
             // Compact form: -efoo → find="foo", next arg is replace
-            out.push("-e".to_string());
+            out.push(OsString::from("-e"));
             let Some(replace) = iter.next() else {
-                out.push(find.to_string());
+                out.push(OsString::from(find));
                 continue;
             };
-            out.push(format!("{find}{EXPR_SEP}{replace}"));
+            let mut pair = OsString::from(find);
+            pair.push(EXPR_SEP.to_string());
+            pair.push(replace);
+            out.push(pair);
         } else {
             out.push(arg);
         }
@@ -1223,7 +1240,7 @@ fn colorized_rename_line(old: &str, new: &str) -> String {
 /// Translate a `Cli` into the decoupled `CompileOptions` consumed by
 /// `expressions::compile_expressions`. Keeps `expressions.rs` independent
 /// of the clap surface.
-fn compile_options_from_cli(cli: &Cli) -> CompileOptions {
+fn compile_options_from_cli(cli: &Cli) -> Result<CompileOptions> {
     let find_only = cli.is_find_only();
     // In transforms-only mode, every surviving positional is a path to walk -
     // NOT a find pattern. Suppress positional_find/replace so
@@ -1234,16 +1251,26 @@ fn compile_options_from_cli(cli: &Cli) -> CompileOptions {
     let positional_find = if cli.uses_expressions() || cli.args.is_empty() || transforms_only {
         None
     } else {
-        Some(cli.pattern().to_string())
+        Some(
+            cli.pattern()
+                .to_str()
+                .context("find pattern must be valid UTF-8")?
+                .to_owned(),
+        )
     };
     let positional_replace =
         if cli.uses_expressions() || find_only || cli.args.len() < 2 || transforms_only {
             None
         } else {
-            Some(cli.replacement().to_string())
+            Some(
+                cli.replacement()
+                    .to_str()
+                    .context("replacement must be valid UTF-8")?
+                    .to_owned(),
+            )
         };
 
-    CompileOptions {
+    Ok(CompileOptions {
         regex: cli.regexp,
         ignore_case: cli.ignore_case,
         greedy: cli.greedy,
@@ -1253,7 +1280,7 @@ fn compile_options_from_cli(cli: &Cli) -> CompileOptions {
         positional_find,
         positional_replace,
         list_files_find_only: cli.list_files && !cli.uses_expressions(),
-    }
+    })
 }
 
 /// Render `n` using the system locale's thousands separator. Locales whose
@@ -1441,7 +1468,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let argv: Vec<_> = std::env::args().collect();
+    let argv: Vec<_> = std::env::args_os().collect();
     let cfg_origin = config::load_into_env();
     let matches = Cli::command().get_matches_from(preprocess_expression_args(argv));
     let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
@@ -1488,20 +1515,11 @@ fn run() -> Result<()> {
         bail!("--null requires reading filenames from stdin");
     }
 
-    // Validate paths exist (only when walking the filesystem).
-    if !from_stdin {
-        for dir in &cli.dirs() {
-            if !std::path::Path::new(dir).exists() {
-                bail!("{dir}: no such file or directory");
-            }
-        }
-    }
-
     if cli.preview && !std::io::stdin().is_terminal() {
         bail!("--preview requires an interactive terminal");
     }
 
-    let opts = compile_options_from_cli(&cli);
+    let opts = compile_options_from_cli(&cli)?;
     let exprs = compile_expressions(&opts)?;
 
     let transforms_opts = transforms::TransformOptions {
@@ -1512,7 +1530,7 @@ fn run() -> Result<()> {
         supplant: cli.supplant.clone(),
     };
 
-    let records = if from_stdin {
+    let found = if from_stdin {
         io::records_from_paths(io::read_paths_from_stdin(cli.null)?)
     } else {
         scan::walk_paths(
@@ -1523,6 +1541,18 @@ fn run() -> Result<()> {
             cli.recursive,
             cli.include_dirs,
         )
+    };
+
+    let records = found.records;
+    for error in &found.errors {
+        print_error(error);
+    }
+    let finish = || -> Result<()> {
+        if found.errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{} paths could not be processed", found.errors.len())
+        }
     };
 
     if cli.list_files {
@@ -1539,7 +1569,7 @@ fn run() -> Result<()> {
                 println!("{}", display_path(&record.path));
             }
         }
-        return Ok(());
+        return finish();
     }
 
     let scope = if cli.only_extension {
@@ -1561,7 +1591,7 @@ fn run() -> Result<()> {
     validate_plan(&plan)?;
 
     if plan.is_empty() {
-        return Ok(());
+        return finish();
     }
 
     // Relocating into a target directory (`-d`) almost always points at a
@@ -1572,7 +1602,7 @@ fn run() -> Result<()> {
         let mut patcher = preview::PreviewPatcher::new();
         let accepted = patcher.prompt_plan(&plan)?;
         if accepted.is_empty() {
-            return Ok(());
+            return finish();
         }
         validate_plan(&accepted)?;
         if create_dirs {
@@ -1580,12 +1610,12 @@ fn run() -> Result<()> {
         }
         apply_plan(&accepted)?;
         print_summary(&accepted, false);
-        return Ok(());
+        return finish();
     }
 
     if !cli.write {
         print_summary(&plan, true);
-        return Ok(());
+        return finish();
     }
 
     if create_dirs {
@@ -1593,7 +1623,7 @@ fn run() -> Result<()> {
     }
     apply_plan(&plan)?;
     print_summary(&plan, false);
-    Ok(())
+    finish()
 }
 
 #[cfg(test)]
@@ -1604,7 +1634,8 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         let _lock = lock_for_parse();
-        let processed = preprocess_expression_args(args.iter().map(|s| s.to_string()).collect());
+        let processed =
+            preprocess_expression_args(args.iter().map(|s| OsString::from(*s)).collect());
         Cli::parse_from(processed)
     }
 
@@ -1612,7 +1643,8 @@ mod tests {
     /// [`EnvGuard`] for the duration of this call - the matches read env
     /// state and would race with a concurrent mutator.
     fn resolve_with_origin(args: &[&str], origin: &config::Origin) -> Result<Cli> {
-        let processed = preprocess_expression_args(args.iter().map(|s| (*s).to_string()).collect());
+        let processed =
+            preprocess_expression_args(args.iter().map(|s| OsString::from(*s)).collect());
         let matches = Cli::command().try_get_matches_from(processed)?;
         let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
         resolve_mutex_groups(&mut cli, &matches, origin)?;
@@ -2305,7 +2337,7 @@ mod tests {
     #[test]
     fn test_compile_options_literal_find_replace() {
         let cli = parse_cli(&["ren", "foo", "bar"]);
-        let opts = compile_options_from_cli(&cli);
+        let opts = compile_options_from_cli(&cli).unwrap();
         assert_eq!(opts.positional_find.as_deref(), Some("foo"));
         assert_eq!(opts.positional_replace.as_deref(), Some("bar"));
         assert!(!opts.list_files_find_only);
@@ -2315,7 +2347,7 @@ mod tests {
     #[test]
     fn test_compile_options_expression_mode_drops_positionals() {
         let cli = parse_cli(&["ren", "-e", "a", "b"]);
-        let opts = compile_options_from_cli(&cli);
+        let opts = compile_options_from_cli(&cli).unwrap();
         // Expression mode never carries positional find/replace.
         assert!(opts.positional_find.is_none());
         assert!(opts.positional_replace.is_none());
@@ -2328,7 +2360,7 @@ mod tests {
         // `-l TODO` with no `-e`: only `<find>` is provided. Compile options
         // should mark this as find-only with no replacement.
         let cli = parse_cli(&["ren", "-l", "TODO"]);
-        let opts = compile_options_from_cli(&cli);
+        let opts = compile_options_from_cli(&cli).unwrap();
         assert!(opts.list_files_find_only);
         assert_eq!(opts.positional_find.as_deref(), Some("TODO"));
         assert!(opts.positional_replace.is_none());
@@ -2337,7 +2369,7 @@ mod tests {
     #[test]
     fn test_compile_options_list_files_with_expressions_is_not_find_only() {
         let cli = parse_cli(&["ren", "-l", "-e", "a", "b"]);
-        let opts = compile_options_from_cli(&cli);
+        let opts = compile_options_from_cli(&cli).unwrap();
         // -e takes over: the find/replace come from -e, not the find-only path.
         assert!(!opts.list_files_find_only);
     }
@@ -2345,7 +2377,7 @@ mod tests {
     #[test]
     fn test_compile_options_carries_regex_flags() {
         let cli = parse_cli(&["ren", "-r", "-i", "-G", "-w", "foo", "bar"]);
-        let opts = compile_options_from_cli(&cli);
+        let opts = compile_options_from_cli(&cli).unwrap();
         assert!(opts.regex);
         assert!(opts.ignore_case);
         assert!(opts.greedy);
@@ -2444,7 +2476,7 @@ mod tests {
         let args = preprocess_expression_args(
             ["ren", "-e", "foo", "bar"]
                 .iter()
-                .map(|s| (*s).to_string())
+                .map(|s| OsString::from(*s))
                 .collect(),
         );
         assert_eq!(args, vec!["ren", "-e", &format!("foo{EXPR_SEP}bar")]);
@@ -2455,7 +2487,7 @@ mod tests {
         let args = preprocess_expression_args(
             ["ren", "-efoo", "bar"]
                 .iter()
-                .map(|s| (*s).to_string())
+                .map(|s| OsString::from(*s))
                 .collect(),
         );
         assert_eq!(args, vec!["ren", "-e", &format!("foo{EXPR_SEP}bar")]);
