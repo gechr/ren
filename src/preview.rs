@@ -9,7 +9,7 @@
 // external diff renderer, no multi-line content. Each prompt covers a single
 // `PlanEntry` with an inline-diff render of the basename change.
 
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -19,8 +19,6 @@ use crossterm::style::Stylize as _;
 use crate::rename::PlanEntry;
 
 mod terminal;
-
-use self::terminal::Color;
 
 /// RAII guard for crossterm raw mode.
 ///
@@ -45,6 +43,7 @@ impl Drop for RawModeGuard {
 /// Sentinel chars for arrow-key navigation in interactive mode.
 const NAV_BACK: char = '\x01';
 const NAV_FORWARD: char = '\x02';
+const INTERRUPTED: char = '\x03';
 
 /// Render `prompt_text`, then read a single keystroke.
 ///
@@ -52,6 +51,7 @@ const NAV_FORWARD: char = '\x02';
 /// `Left`/`Right` arrows return `NAV_BACK`/`NAV_FORWARD` (suppressed at the
 /// first/last entry respectively). `Ctrl-C` exits the process with code 130.
 fn prompt(
+    out: &mut impl io::Write,
     prompt_text: &str,
     letters: &str,
     default: Option<char>,
@@ -60,8 +60,8 @@ fn prompt(
 ) -> Result<char> {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-    print!("{prompt_text}");
-    std::io::stdout().flush()?;
+    write!(out, "{prompt_text}")?;
+    out.flush()?;
 
     let guard = RawModeGuard::enter()?;
     let result = loop {
@@ -71,8 +71,7 @@ fn prompt(
         {
             match code {
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    // RawModeGuard's Drop restores cooked mode during unwind.
-                    std::process::exit(130);
+                    break Ok(INTERRUPTED);
                 }
                 KeyCode::Enter => {
                     if let Some(default) = default {
@@ -94,13 +93,18 @@ fn prompt(
     };
     drop(guard);
     if let Ok(c) = result {
-        match c {
-            NAV_BACK => print!("{}\r", "←".yellow()),
-            NAV_FORWARD => print!("{}\r", "→".yellow()),
-            'y' | 'A' => println!("{}", c.to_string().green()),
-            'n' | 'q' => println!("{}", c.to_string().red()),
-            _ => println!("{c}"),
+        // process::exit does not run destructors. Restore raw mode first.
+        if c == INTERRUPTED {
+            std::process::exit(130);
         }
+        match c {
+            NAV_BACK => write!(out, "{}\r", "←".yellow())?,
+            NAV_FORWARD => write!(out, "{}\r", "→".yellow())?,
+            'y' | 'A' => writeln!(out, "{}", c.to_string().green())?,
+            'n' | 'q' => writeln!(out, "{}", c.to_string().red())?,
+            _ => writeln!(out, "{c}")?,
+        }
+        out.flush()?;
     }
     result
 }
@@ -146,7 +150,7 @@ fn display_parent(path: &Path) -> Option<String> {
 /// Render `old → new` as a single side-by-side line with the changed slice
 /// colored red on the left, green on the right, and the unchanged
 /// prefix/suffix preserved on both sides.
-fn print_inline_diff(old_path: &Path, new_path: &Path) {
+fn write_inline_diff(out: &mut impl io::Write, old_path: &Path, new_path: &Path) -> io::Result<()> {
     // Filenames are guaranteed UTF-8 by `build_plan` (non-UTF-8 basenames are
     // skipped at scan time). `to_string_lossy` is the conservative fallback if
     // a non-UTF-8 path slips through.
@@ -171,27 +175,22 @@ fn print_inline_diff(old_path: &Path, new_path: &Path) {
 
     if let Some(parent) = parent.as_deref() {
         let parent_with_sep = format!("{parent}/");
-        print!("{}", parent_with_sep.as_str().dim());
+        write!(out, "{}", parent_with_sep.as_str().dim())?;
     }
 
-    print!("{prefix}");
-    terminal::fg(Color::Red);
-    print!("{old_changed}");
-    terminal::reset();
-    print!("{suffix}");
-
-    print!("  {}  ", "→".dim());
+    write!(
+        out,
+        "{prefix}{}{suffix}  {}  ",
+        old_changed.dark_red(),
+        "→".dim()
+    )?;
 
     if let Some(parent) = parent.as_deref() {
         let parent_with_sep = format!("{parent}/");
-        print!("{}", parent_with_sep.as_str().dim());
+        write!(out, "{}", parent_with_sep.as_str().dim())?;
     }
 
-    print!("{prefix}");
-    terminal::fg(Color::Green);
-    print!("{new_changed}");
-    terminal::reset();
-    println!("{suffix}");
+    writeln!(out, "{prefix}{}{suffix}", new_changed.dark_green())
 }
 
 /// Apply a user action to the decision stack and return the new index.
@@ -245,6 +244,7 @@ impl PreviewPatcher {
     /// re-prompt. After `A`, subsequent iterations auto-accept without
     /// prompting. `q` stops prompting and returns the accepted entries so far.
     pub(crate) fn prompt_plan(&mut self, plan: &[PlanEntry]) -> Result<Vec<PlanEntry>> {
+        let mut out = io::stdout().lock();
         let total = plan.len();
         let mut decisions: Vec<(usize, bool)> = Vec::with_capacity(total);
         let mut idx = 0;
@@ -259,13 +259,13 @@ impl PreviewPatcher {
             }
 
             let entry = &plan[idx];
-            terminal::hide_cursor();
-            terminal::clear();
+            let mut cursor = terminal::HiddenCursor::new(&mut out)?;
+            terminal::clear(cursor.writer())?;
 
             // Header: position counter + parent context.
             let header = format!("Rename [{}/{}]", idx + 1, total);
-            println!("{}", header.yellow().bold());
-            print_inline_diff(&entry.old, &entry.new);
+            writeln!(cursor.writer(), "{}", header.yellow().bold())?;
+            write_inline_diff(cursor.writer(), &entry.old, &entry.new)?;
 
             let prompt_text = format!(
                 "\n{} {}{}{}{}{}{}{}{}{}{}{}{}",
@@ -284,8 +284,15 @@ impl PreviewPatcher {
                 "❯ ".yellow(),
             );
 
-            terminal::show_cursor();
-            let action = prompt(&prompt_text, "ynAq", Some('y'), idx == 0, idx + 1 == total)?;
+            cursor.finish()?;
+            let action = prompt(
+                &mut out,
+                &prompt_text,
+                "ynAq",
+                Some('y'),
+                idx == 0,
+                idx + 1 == total,
+            )?;
 
             match action {
                 'y' => {
@@ -323,10 +330,12 @@ impl PreviewPatcher {
 }
 
 fn accepted_entries(plan: &[PlanEntry], decisions: &[(usize, bool)]) -> Vec<PlanEntry> {
-    plan.iter()
-        .enumerate()
-        .filter(|(i, _)| decisions.iter().any(|(j, accepted)| *j == *i && *accepted))
-        .map(|(_, e)| e.clone())
+    // Decisions form the ordered prefix visited by the prompt. Going back
+    // pops a decision before replacing it, so each index occurs only once.
+    decisions
+        .iter()
+        .filter(|(_, accepted)| *accepted)
+        .map(|(index, _)| plan[*index].clone())
         .collect()
 }
 
@@ -339,6 +348,78 @@ mod tests {
     use super::decide;
     use super::display_parent;
     use crate::rename::PlanEntry;
+
+    struct FailingWriter {
+        fail_on_flush: bool,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_on_flush {
+                Ok(bytes.len())
+            } else {
+                Err(std::io::Error::other("write failed"))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+
+    #[test]
+    fn prompt_output_failure_returns_before_entering_raw_mode() {
+        for fail_on_flush in [false, true] {
+            let error = super::prompt(
+                &mut FailingWriter { fail_on_flush },
+                "Accept? ",
+                "yn",
+                Some('y'),
+                true,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if fail_on_flush {
+                    "flush failed"
+                } else {
+                    "write failed"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inline_diff_returns_write_failures() {
+        let error = super::write_inline_diff(
+            &mut FailingWriter {
+                fail_on_flush: false,
+            },
+            std::path::Path::new("src/old.txt"),
+            std::path::Path::new("src/new.txt"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "write failed");
+    }
+
+    #[test]
+    fn revising_an_accept_removes_it_from_final_selection() {
+        let plan: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| PlanEntry {
+                old: PathBuf::from(name),
+                new: PathBuf::from(name.to_uppercase()),
+                depth: 1,
+            })
+            .collect();
+        let mut decisions = Vec::new();
+        decide(&mut decisions, 0, 'y');
+        decide(&mut decisions, 1, 'y');
+        let revised = decide(&mut decisions, 2, '<');
+        decide(&mut decisions, revised, 'n');
+        assert_eq!(accepted_entries(&plan, &decisions), vec![plan[0].clone()]);
+    }
 
     // ---- decide -----------------------------------------------------------
 
