@@ -4,8 +4,6 @@ mod io;
 mod preview;
 mod rename;
 mod scan;
-#[cfg(test)]
-mod test_env;
 mod transforms;
 
 use std::ffi::{OsStr, OsString};
@@ -23,6 +21,50 @@ use crate::expressions::{CompileOptions, EXPR_SEP, compile_expressions};
 use crate::rename::{
     ExtensionScope, PlanEntry, apply_plan_interruptible as apply_plan, build_plan, validate_plan,
 };
+
+fn parse_with_config(
+    argv: Vec<OsString>,
+    env: &config::Environment,
+    config: &config::Config,
+) -> clap::error::Result<(Cli, ArgMatches, config::Origin)> {
+    let values = config.values();
+    let mut origin = config::Origin::default();
+    let mut command = Cli::command();
+    let ids: Vec<_> = command
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+    for id in ids {
+        let Some(name) = arg_env_name(&id) else {
+            continue;
+        };
+        let value = if let Some(value) = env.get(name) {
+            origin
+                .sources
+                .insert(id.clone(), config::Source::Environment);
+            Some(value.to_os_string())
+        } else if let Some(value) = values.get(name) {
+            origin.sources.insert(id.clone(), config::Source::Config);
+            Some(value.clone())
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            command = command.mut_arg(&id, |arg| arg.default_value(value));
+        }
+    }
+    let matches = command.try_get_matches_from(preprocess_expression_args(argv))?;
+    let cli = Cli::from_arg_matches(&matches)?;
+    // Clap's `requires` treats default values as absent. Check the resolved
+    // values so config and environment sources obey the same dependency.
+    if cli.parents && cli.directory.is_none() {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "the following required arguments were not provided:\n  --directory <DIR>",
+        ));
+    }
+    Ok((cli, matches, origin))
+}
 
 #[derive(Parser)]
 #[command(name = "ren", version, disable_help_flag = true)]
@@ -49,7 +91,6 @@ struct Cli {
     #[arg(
         short = 'H',
         long = "hidden",
-        env = "REN_HIDDEN",
         value_parser = BoolishValueParser::new()
     )]
     hidden: bool,
@@ -57,7 +98,6 @@ struct Cli {
     /// Ignore .gitignore / .ignore / .git/info/exclude
     #[arg(
         long = "no-ignore",
-        env = "REN_NO_IGNORE",
         value_parser = BoolishValueParser::new()
     )]
     no_ignore: bool,
@@ -66,7 +106,6 @@ struct Cli {
     #[arg(
         short = 'R',
         long = "recursive",
-        env = "REN_RECURSIVE",
         value_parser = BoolishValueParser::new()
     )]
     recursive: bool,
@@ -75,7 +114,6 @@ struct Cli {
     #[arg(
         short = 'D',
         long = "include-dirs",
-        env = "REN_INCLUDE_DIRS",
         value_parser = BoolishValueParser::new()
     )]
     include_dirs: bool,
@@ -89,7 +127,6 @@ struct Cli {
     #[arg(
         short = 'x',
         long = "include-extension",
-        env = "REN_INCLUDE_EXTENSION",
         value_parser = BoolishValueParser::new()
     )]
     include_extension: bool,
@@ -101,7 +138,6 @@ struct Cli {
     #[arg(
         short = 'X',
         long = "only-extension",
-        env = "REN_ONLY_EXTENSION",
         value_parser = BoolishValueParser::new()
     )]
     only_extension: bool,
@@ -110,7 +146,6 @@ struct Cli {
     #[arg(
         short = 'G',
         long = "greedy",
-        env = "REN_GREEDY",
         value_parser = BoolishValueParser::new()
     )]
     greedy: bool,
@@ -119,7 +154,6 @@ struct Cli {
     #[arg(
         short = 'i',
         long = "ignore-case",
-        env = "REN_IGNORE_CASE",
         value_parser = BoolishValueParser::new()
     )]
     ignore_case: bool,
@@ -129,7 +163,6 @@ struct Cli {
         short = 'r',
         long = "regex",
         alias = "regexp",
-        env = "REN_REGEX",
         value_parser = BoolishValueParser::new()
     )]
     regexp: bool,
@@ -138,7 +171,6 @@ struct Cli {
     #[arg(
         short = 'S',
         long = "smart",
-        env = "REN_SMART",
         value_parser = BoolishValueParser::new()
     )]
     smart: bool,
@@ -147,7 +179,6 @@ struct Cli {
     #[arg(
         short = 'L',
         long = "lower",
-        env = "REN_LOWER",
         value_parser = BoolishValueParser::new()
     )]
     lower: bool,
@@ -156,7 +187,6 @@ struct Cli {
     #[arg(
         short = 'U',
         long = "upper",
-        env = "REN_UPPER",
         value_parser = BoolishValueParser::new()
     )]
     upper: bool,
@@ -166,13 +196,13 @@ struct Cli {
     /// Templates: `{n}` substitutes a 1-based per-parent-directory counter;
     /// `{n:0WIDTH}` zero-pads to `WIDTH` digits; `{N}` zero-pads to a smart
     /// per-parent width. `--prepend` and `--append` share the same counter.
-    #[arg(short = 'P', long = "prepend", value_name = "FMT", env = "REN_PREPEND")]
+    #[arg(short = 'P', long = "prepend", value_name = "FMT")]
     prepend: Option<String>,
 
     /// Append a literal string or template to each name
     ///
     /// See `--prepend` for the templating DSL.
-    #[arg(short = 'A', long = "append", value_name = "FMT", env = "REN_APPEND")]
+    #[arg(short = 'A', long = "append", value_name = "FMT")]
     append: Option<String>,
 
     /// Replace each name with a literal string or template
@@ -182,12 +212,7 @@ struct Cli {
     /// `{N}`) and runs on the same segment as the rest of the pipeline - the
     /// stem by default, so the extension is preserved: `ren --supplant '{n:02}'`
     /// renames to `01.jpg`, `02.jpg`, ….
-    #[arg(
-        short = 's',
-        long = "supplant",
-        value_name = "FMT",
-        env = "REN_SUPPLANT"
-    )]
+    #[arg(short = 's', long = "supplant", value_name = "FMT")]
     supplant: Option<String>,
 
     /// Change, add, or strip the file extension
@@ -200,12 +225,7 @@ struct Cli {
     /// `notes.bak` into `notes`). The whole extension is replaced, including
     /// compound ones (`archive.tar.gz` → `archive.zip`). Mutually exclusive
     /// with `-x`/`-X`.
-    #[arg(
-        short = 'E',
-        long = "change-extension",
-        value_name = "EXT",
-        env = "REN_CHANGE_EXTENSION"
-    )]
+    #[arg(short = 'E', long = "change-extension", value_name = "EXT")]
     change_extension: Option<String>,
 
     /// Find replace expression
@@ -216,7 +236,6 @@ struct Cli {
     #[arg(
         short = 'w',
         long = "word-regexp",
-        env = "REN_WORD_REGEXP",
         value_parser = BoolishValueParser::new()
     )]
     word_regexp: bool,
@@ -234,7 +253,6 @@ struct Cli {
         short = 'n',
         long = "dry-run",
         alias = "dry",
-        env = "REN_DRY_RUN",
         value_parser = BoolishValueParser::new()
     )]
     dry_run: bool,
@@ -247,7 +265,6 @@ struct Cli {
         short = 'W',
         short_alias = 'y',
         long = "write",
-        env = "REN_WRITE",
         value_parser = BoolishValueParser::new()
     )]
     write: bool,
@@ -256,7 +273,6 @@ struct Cli {
     #[arg(
         short = 'p',
         long = "preview",
-        env = "REN_PREVIEW",
         value_parser = BoolishValueParser::new()
     )]
     preview: bool,
@@ -264,7 +280,6 @@ struct Cli {
     /// Create missing parent directories for rename targets.
     #[arg(
         long = "create-dirs",
-        env = "REN_CREATE_DIRS",
         value_parser = BoolishValueParser::new()
     )]
     create_dirs: bool,
@@ -276,13 +291,7 @@ struct Cli {
     /// immaterial (`-d a/b` and `-d a/b/` behave identically). Missing parent
     /// directories are created automatically (implies `--create-dirs`). Use
     /// `--parents` to preserve the source's directory structure instead.
-    #[arg(
-        short = 'd',
-        long = "directory",
-        alias = "dir",
-        value_name = "DIR",
-        env = "REN_DIRECTORY"
-    )]
+    #[arg(short = 'd', long = "directory", alias = "dir", value_name = "DIR")]
     directory: Option<PathBuf>,
 
     /// Preserve the source's parent directories under `-d <dir>`.
@@ -293,8 +302,6 @@ struct Cli {
     /// meaningful alongside `-d`, which it requires.
     #[arg(
         long = "parents",
-        requires = "directory",
-        env = "REN_PARENTS",
         value_parser = BoolishValueParser::new()
     )]
     parents: bool,
@@ -638,8 +645,9 @@ fn resolve_mutex_groups(
             if id == "change_extension" {
                 match matches.value_source(id) {
                     Some(ValueSource::CommandLine) => true,
-                    Some(ValueSource::EnvVariable) => {
-                        matches.get_one::<String>(id).is_some_and(|v| !v.is_empty())
+                    Some(ValueSource::DefaultValue) if origin.sources.contains_key(id) => {
+                        matches!(origin.sources.get(id), Some(config::Source::Config))
+                            || matches.get_one::<String>(id).is_some_and(|v| !v.is_empty())
                     }
                     _ => false,
                 }
@@ -743,14 +751,10 @@ impl Tier {
 fn tier_of(id: &str, matches: &ArgMatches, origin: &config::Origin) -> Option<Tier> {
     match matches.value_source(id) {
         Some(ValueSource::CommandLine) => Some(Tier::Cli),
-        Some(ValueSource::EnvVariable) => {
-            let env_name = arg_env_name(id)?;
-            if origin.is_config_derived(env_name) {
-                Some(Tier::Config)
-            } else {
-                Some(Tier::ShellEnv)
-            }
-        }
+        Some(ValueSource::DefaultValue) => origin.sources.get(id).map(|source| match source {
+            config::Source::Config => Tier::Config,
+            config::Source::Environment => Tier::ShellEnv,
+        }),
         _ => None,
     }
 }
@@ -1469,13 +1473,11 @@ fn main() {
 
 fn run() -> Result<()> {
     let argv: Vec<_> = std::env::args_os().collect();
-    let cfg_origin = config::load_into_env();
-    let matches = Cli::command().get_matches_from(preprocess_expression_args(argv));
-    let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
+    let environment = config::Environment::capture();
+    let config = config::Config::load(&environment);
+    let (mut cli, matches, cfg_origin) =
+        parse_with_config(argv, &environment, &config).unwrap_or_else(|error| error.exit());
     resolve_mutex_groups(&mut cli, &matches, &cfg_origin)?;
-    // Clear config-synthesized env so spawned subprocesses inherit only the
-    // user's real shell env.
-    cfg_origin.unset_synthesized();
 
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "ren", &mut std::io::stdout());
@@ -1630,44 +1632,51 @@ fn run() -> Result<()> {
 mod tests {
     use super::*;
 
-    use crate::test_env::{EnvGuard, lock_for_parse};
-
     fn parse_cli(args: &[&str]) -> Cli {
-        let _lock = lock_for_parse();
-        let processed =
-            preprocess_expression_args(args.iter().map(|s| OsString::from(*s)).collect());
-        Cli::parse_from(processed)
+        let argv = args.iter().map(OsString::from).collect();
+        parse_with_config(
+            argv,
+            &config::Environment::default(),
+            &config::Config::default(),
+        )
+        .unwrap()
+        .0
     }
 
-    /// Resolver helper for env-aware tests. The caller must hold an
-    /// [`EnvGuard`] for the duration of this call - the matches read env
-    /// state and would race with a concurrent mutator.
-    fn resolve_with_origin(args: &[&str], origin: &config::Origin) -> Result<Cli> {
-        let processed =
-            preprocess_expression_args(args.iter().map(|s| OsString::from(*s)).collect());
-        let matches = Cli::command().try_get_matches_from(processed)?;
-        let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!(e))?;
-        resolve_mutex_groups(&mut cli, &matches, origin)?;
+    fn resolve_with_origin(
+        args: &[&str],
+        env: &config::Environment,
+        overrides: &config::Origin,
+    ) -> Result<Cli> {
+        let argv = args.iter().map(OsString::from).collect();
+        let (mut cli, matches, mut origin) =
+            parse_with_config(argv, env, &config::Config::default())?;
+        origin.sources.extend(
+            overrides
+                .sources
+                .iter()
+                .map(|(key, source)| (key.clone(), *source)),
+        );
+        resolve_mutex_groups(&mut cli, &matches, &origin)?;
         Ok(cli)
     }
 
-    /// Resolver helper for tests that DON'T mutate env. Acquires
-    /// [`ENV_MUTEX`] and scrubs ambient `REN_*` vars internally so that
-    /// concurrent env-mutating tests (which take the same lock via
-    /// `EnvGuard`) can't leak state into clap's parse. The mutex is held
-    /// only for the parse + resolve; reads of the returned `Cli` are safe.
     fn parse_and_resolve(args: &[&str]) -> Result<Cli> {
-        let _lock = lock_for_parse();
-        resolve_with_origin(args, &config::Origin::default())
+        resolve_with_origin(
+            args,
+            &config::Environment::default(),
+            &config::Origin::default(),
+        )
     }
 
-    /// Build a config `Origin` claiming the given env var names are
-    /// config-derived. Used to simulate `apply_to_env` having projected
-    /// values onto the environment without actually loading a config file.
-    fn fake_config_origin(keys: &'static [&'static str]) -> config::Origin {
+    fn fake_config_origin(keys: &[&str]) -> config::Origin {
         let mut origin = config::Origin::default();
-        for k in keys {
-            origin.mark_as_config_derived(k);
+        for arg in Cli::command().get_arguments() {
+            if arg_env_name(arg.get_id().as_str()).is_some_and(|name| keys.contains(&name)) {
+                origin
+                    .sources
+                    .insert(arg.get_id().to_string(), config::Source::Config);
+            }
         }
         origin
     }
@@ -1974,7 +1983,7 @@ mod tests {
 
     #[test]
     fn test_env_defaults_enable_boolean_flags() {
-        let _g = EnvGuard::set(&[
+        let env = config::Environment::from_pairs(&[
             ("REN_HIDDEN", "1"),
             ("REN_NO_IGNORE", "true"),
             ("REN_RECURSIVE", "1"),
@@ -1988,7 +1997,8 @@ mod tests {
             ("REN_DRY_RUN", "1"),
             ("REN_CREATE_DIRS", "true"),
         ]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        let cli =
+            resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default()).unwrap();
         assert!(cli.hidden);
         assert!(cli.no_ignore);
         assert!(cli.recursive);
@@ -2014,24 +2024,27 @@ mod tests {
     fn test_env_only_extension_branch_of_mutex_group() {
         // Counterpart of `test_env_defaults_enable_boolean_flags`, which
         // exercises the `include_extension` side of the same mutex pair.
-        let _g = EnvGuard::set(&[("REN_ONLY_EXTENSION", "1")]);
-        let cli = resolve_with_origin(&["ren", "rs", "txt"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_ONLY_EXTENSION", "1")]);
+        let cli =
+            resolve_with_origin(&["ren", "rs", "txt"], &env, &config::Origin::default()).unwrap();
         assert!(cli.only_extension);
         assert!(!cli.include_extension);
     }
 
     #[test]
     fn test_env_prepend_and_append_string_values() {
-        let _g = EnvGuard::set(&[("REN_PREPEND", "{N}_"), ("REN_APPEND", "-{n}")]);
-        let cli = resolve_with_origin(&["ren"], &config::Origin::default()).unwrap();
+        let env =
+            config::Environment::from_pairs(&[("REN_PREPEND", "{N}_"), ("REN_APPEND", "-{n}")]);
+        let cli = resolve_with_origin(&["ren"], &env, &config::Origin::default()).unwrap();
         assert_eq!(cli.prepend.as_deref(), Some("{N}_"));
         assert_eq!(cli.append.as_deref(), Some("-{n}"));
     }
 
     #[test]
     fn test_env_directory_string_value() {
-        let _g = EnvGuard::set(&[("REN_DIRECTORY", "foo/bar")]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_DIRECTORY", "foo/bar")]);
+        let cli =
+            resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default()).unwrap();
         assert_eq!(
             cli.directory.as_deref(),
             Some(std::path::Path::new("foo/bar"))
@@ -2043,8 +2056,9 @@ mod tests {
         // `Option<String>` env vars must collapse `Some("")` to `None`, else
         // `uses_transforms()` flips ren into transforms-only mode and the next
         // positional gets misparsed as a path. Pin the behavior here.
-        let _g = EnvGuard::set(&[("REN_PREPEND", ""), ("REN_APPEND", "")]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_PREPEND", ""), ("REN_APPEND", "")]);
+        let cli =
+            resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default()).unwrap();
         assert!(cli.prepend.is_none());
         assert!(cli.append.is_none());
         assert!(!cli.uses_transforms());
@@ -2055,13 +2069,14 @@ mod tests {
         // `BoolishValueParser` accepts "0"/"false" (case-insensitive) as
         // falsy. Setting these via env is equivalent to leaving the flag
         // unset on the CLI - the boolean stays `false`.
-        let _g = EnvGuard::set(&[
+        let env = config::Environment::from_pairs(&[
             ("REN_HIDDEN", "0"),
             ("REN_RECURSIVE", "false"),
             ("REN_INCLUDE_DIRS", "FALSE"),
             ("REN_SMART", "false"),
         ]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        let cli =
+            resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default()).unwrap();
         assert!(!cli.hidden);
         assert!(!cli.recursive);
         assert!(!cli.include_dirs);
@@ -2073,8 +2088,8 @@ mod tests {
         // `BoolishValueParser` only accepts truthy/falsy tokens; an empty
         // string is neither and parses fail. This catches typos in `.env`
         // files where a variable is mentioned without a value.
-        let _g = EnvGuard::set(&[("REN_INCLUDE_DIRS", "")]);
-        let err = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default())
+        let env = config::Environment::from_pairs(&[("REN_INCLUDE_DIRS", "")]);
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default())
             .err()
             .expect("empty bool should fail to parse");
         assert!(
@@ -2088,9 +2103,13 @@ mod tests {
     #[test]
     fn test_cli_write_beats_shell_env_dry_run() {
         // Mode-group precedence: CLI `--write` beats a shell-env REN_DRY_RUN.
-        let _g = EnvGuard::set(&[("REN_DRY_RUN", "1")]);
-        let cli =
-            resolve_with_origin(&["ren", "-W", "foo", "bar"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_DRY_RUN", "1")]);
+        let cli = resolve_with_origin(
+            &["ren", "-W", "foo", "bar"],
+            &env,
+            &config::Origin::default(),
+        )
+        .unwrap();
         assert!(cli.write);
         assert!(!cli.dry_run);
     }
@@ -2161,9 +2180,10 @@ mod tests {
 
     #[test]
     fn test_cli_lower_beats_shell_env_upper() {
-        let _g = EnvGuard::set(&[("REN_UPPER", "true")]);
+        let env = config::Environment::from_pairs(&[("REN_UPPER", "true")]);
         let cli = resolve_with_origin(
             &["ren", "--lower", "foo", "bar"],
+            &env,
             &config::Origin::default(),
         )
         .unwrap();
@@ -2175,9 +2195,9 @@ mod tests {
     fn test_shell_env_beats_config_in_mutex_group() {
         // Config sets lower=true (synthesized REN_LOWER), shell sets
         // REN_UPPER=true. Shell wins over config.
-        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let env = config::Environment::from_pairs(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
         let origin = fake_config_origin(&["REN_LOWER"]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &origin).unwrap();
+        let cli = resolve_with_origin(&["ren", "foo", "bar"], &env, &origin).unwrap();
         assert!(
             cli.upper,
             "shell REN_UPPER must beat config-derived REN_LOWER"
@@ -2187,8 +2207,8 @@ mod tests {
 
     #[test]
     fn test_two_shell_env_vars_in_one_group_errors() {
-        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
-        let err = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default())
+        let env = config::Environment::from_pairs(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default())
             .err()
             .expect("expected resolver error")
             .to_string();
@@ -2200,9 +2220,9 @@ mod tests {
 
     #[test]
     fn test_two_config_keys_in_one_group_errors() {
-        let _g = EnvGuard::set(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
+        let env = config::Environment::from_pairs(&[("REN_LOWER", "true"), ("REN_UPPER", "true")]);
         let origin = fake_config_origin(&["REN_LOWER", "REN_UPPER"]);
-        let err = resolve_with_origin(&["ren", "foo", "bar"], &origin)
+        let err = resolve_with_origin(&["ren", "foo", "bar"], &env, &origin)
             .err()
             .expect("expected resolver error")
             .to_string();
@@ -2214,9 +2234,10 @@ mod tests {
 
     #[test]
     fn test_cli_only_extension_beats_shell_env_include_extension() {
-        let _g = EnvGuard::set(&[("REN_INCLUDE_EXTENSION", "true")]);
+        let env = config::Environment::from_pairs(&[("REN_INCLUDE_EXTENSION", "true")]);
         let cli = resolve_with_origin(
             &["ren", "--only-extension", "rs", "txt"],
+            &env,
             &config::Origin::default(),
         )
         .unwrap();
@@ -2229,12 +2250,12 @@ mod tests {
         // Config sets include-extension; shell sets REN_ONLY_EXTENSION. Shell
         // wins. Same precedence as lower/upper, this just pins the second
         // mutex group's wiring.
-        let _g = EnvGuard::set(&[
+        let env = config::Environment::from_pairs(&[
             ("REN_INCLUDE_EXTENSION", "true"),
             ("REN_ONLY_EXTENSION", "true"),
         ]);
         let origin = fake_config_origin(&["REN_INCLUDE_EXTENSION"]);
-        let cli = resolve_with_origin(&["ren", "rs", "txt"], &origin).unwrap();
+        let cli = resolve_with_origin(&["ren", "rs", "txt"], &env, &origin).unwrap();
         assert!(
             cli.only_extension,
             "shell REN_ONLY_EXTENSION must beat config-derived REN_INCLUDE_EXTENSION"
@@ -2244,11 +2265,11 @@ mod tests {
 
     #[test]
     fn test_two_shell_env_vars_in_extension_group_errors() {
-        let _g = EnvGuard::set(&[
+        let env = config::Environment::from_pairs(&[
             ("REN_INCLUDE_EXTENSION", "true"),
             ("REN_ONLY_EXTENSION", "true"),
         ]);
-        let err = resolve_with_origin(&["ren", "rs", "txt"], &config::Origin::default())
+        let err = resolve_with_origin(&["ren", "rs", "txt"], &env, &config::Origin::default())
             .err()
             .expect("expected resolver error")
             .to_string();
@@ -2274,9 +2295,10 @@ mod tests {
 
     #[test]
     fn test_cli_change_extension_beats_shell_env_only_extension() {
-        let _g = EnvGuard::set(&[("REN_ONLY_EXTENSION", "true")]);
+        let env = config::Environment::from_pairs(&[("REN_ONLY_EXTENSION", "true")]);
         let cli = resolve_with_origin(
             &["ren", "-E", "png", "foo", "bar"],
+            &env,
             &config::Origin::default(),
         )
         .unwrap();
@@ -2288,8 +2310,9 @@ mod tests {
     fn test_empty_change_extension_env_is_ignored() {
         // A stray empty REN_CHANGE_EXTENSION must not be treated as a request to
         // strip every file's extension; it resolves to "unset".
-        let _g = EnvGuard::set(&[("REN_CHANGE_EXTENSION", "")]);
-        let cli = resolve_with_origin(&["ren", "foo", "bar"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_CHANGE_EXTENSION", "")]);
+        let cli =
+            resolve_with_origin(&["ren", "foo", "bar"], &env, &config::Origin::default()).unwrap();
         assert_eq!(cli.change_extension, None);
     }
 
@@ -2302,22 +2325,91 @@ mod tests {
     }
 
     #[test]
-    fn test_arg_env_name_matches_clap_spec() {
-        // The hardcoded `arg_env_name` map mirrors the `env = ...` attributes
-        // on the `Cli` struct. If a new env-backed flag is added without
-        // updating the map, source-aware resolution and config-tier error
-        // wording will silently misclassify it.
-        let _lock = lock_for_parse();
-        let cmd = Cli::command();
-        for arg in cmd.get_arguments() {
-            if let Some(declared) = arg.get_env() {
-                let id = arg.get_id().as_str();
-                let mapped = arg_env_name(id);
+    fn configured_keys_have_cli_mappings() {
+        let config = config::Config {
+            change_extension: Some("png".into()),
+            hidden: Some(true),
+            ..config::Config::default()
+        };
+        let command = Cli::command();
+        for key in config.values().keys() {
+            assert!(
+                command
+                    .get_arguments()
+                    .any(|arg| arg_env_name(arg.get_id().as_str()) == Some(*key))
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_config_environment_and_cli_precedence() {
+        let cfg = config::Config {
+            hidden: Some(true),
+            change_extension: Some("png".into()),
+            ..config::Config::default()
+        };
+        let env = config::Environment::from_pairs(&[
+            ("REN_HIDDEN", "false"),
+            ("REN_CHANGE_EXTENSION", "jpg"),
+        ]);
+        let argv = ["ren", "--hidden", "-E", "webp"]
+            .map(OsString::from)
+            .to_vec();
+        let (mut cli, matches, origin) = parse_with_config(argv, &env, &cfg).unwrap();
+        resolve_mutex_groups(&mut cli, &matches, &origin).unwrap();
+        assert!(cli.hidden);
+        assert_eq!(cli.change_extension.as_deref(), Some("webp"));
+        let (cli, _, _) = parse_with_config(vec!["ren".into()], &env, &cfg).unwrap();
+        assert!(!cli.hidden);
+        assert_eq!(cli.change_extension.as_deref(), Some("jpg"));
+    }
+
+    #[test]
+    fn empty_config_extension_strips_without_mutating_process_environment() {
+        let before = std::env::var_os("REN_CHANGE_EXTENSION").is_some();
+        let cfg: config::Config = toml::from_str("change-extension = \"\"").unwrap();
+        let (mut cli, matches, origin) =
+            parse_with_config(vec!["ren".into()], &config::Environment::default(), &cfg).unwrap();
+        resolve_mutex_groups(&mut cli, &matches, &origin).unwrap();
+        assert_eq!(cli.change_extension.as_deref(), Some(""));
+        assert_eq!(std::env::var_os("REN_CHANGE_EXTENSION").is_some(), before);
+    }
+
+    #[test]
+    fn parents_dependency_uses_all_resolved_sources() {
+        let empty = config::Environment::default();
+        let parents = config::Environment::from_pairs(&[("REN_PARENTS", "true")]);
+        let directory = config::Environment::from_pairs(&[("REN_DIRECTORY", "out")]);
+        let disabled = config::Environment::from_pairs(&[("REN_PARENTS", "false")]);
+        let cfg: config::Config = toml::from_str("parents = true").unwrap();
+        let cfg_dir: config::Config = toml::from_str("directory = \"out\"").unwrap();
+        for (args, env, config, valid) in [
+            (
+                vec!["ren", "--parents"],
+                &empty,
+                &config::Config::default(),
+                false,
+            ),
+            (vec!["ren"], &parents, &config::Config::default(), false),
+            (vec!["ren"], &empty, &cfg, false),
+            (
+                vec!["ren", "--parents"],
+                &directory,
+                &config::Config::default(),
+                true,
+            ),
+            (vec!["ren", "--parents"], &empty, &cfg_dir, true),
+            (vec!["ren", "-d", "out"], &empty, &cfg, true),
+            (vec!["ren"], &disabled, &cfg, true),
+        ] {
+            let result = parse_with_config(args.iter().map(OsString::from).collect(), env, config);
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
                 assert_eq!(
-                    mapped,
-                    Some(declared.to_str().expect("env name is UTF-8")),
-                    "arg_env_name({id}) does not match clap's env attribute",
+                    error.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument
                 );
+                assert_eq!(error.exit_code(), 2);
             }
         }
     }
@@ -2326,9 +2418,13 @@ mod tests {
     fn test_cli_flag_wins_over_env_for_booleans() {
         // Explicit `-R` set on CLI beats `REN_RECURSIVE=0` from env (clap's
         // ValueSource::CommandLine wins over ValueSource::EnvVariable).
-        let _g = EnvGuard::set(&[("REN_RECURSIVE", "0")]);
-        let cli =
-            resolve_with_origin(&["ren", "-R", "foo", "bar"], &config::Origin::default()).unwrap();
+        let env = config::Environment::from_pairs(&[("REN_RECURSIVE", "0")]);
+        let cli = resolve_with_origin(
+            &["ren", "-R", "foo", "bar"],
+            &env,
+            &config::Origin::default(),
+        )
+        .unwrap();
         assert!(cli.recursive);
     }
 

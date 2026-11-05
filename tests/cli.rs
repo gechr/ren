@@ -647,6 +647,26 @@ fn transform_defaults_with_invalid_roots_cannot_modify_other_roots() {
 }
 
 #[test]
+fn configuration_can_change_extensions_and_cli_overrides_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("settings.toml");
+    fs::write(&config, "change-extension = \"png\"\n").unwrap();
+    fs::write(dir.path().join("a.jpg"), "content").unwrap();
+    ren(&dir)
+        .env("REN_CONFIG_PATH", &config)
+        .args(["-W", "a.jpg"])
+        .assert()
+        .success();
+    assert!(dir.path().join("a.png").exists());
+    ren(&dir)
+        .env("REN_CONFIG_PATH", &config)
+        .args(["-W", "-E", "webp", "a.png"])
+        .assert()
+        .success();
+    assert!(dir.path().join("a.webp").exists());
+}
+
+#[test]
 fn overlapping_roots_keep_first_root_and_number_each_entry_once() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join("sub/nested")).unwrap();

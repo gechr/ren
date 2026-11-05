@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "string"] }
 clap_complete = "4"
 crossterm = "0.29"
 ctrlc = { version = "3.5", features = ["termination"] }
