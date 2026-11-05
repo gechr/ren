@@ -5,11 +5,11 @@
 // `&str` slices, so we work directly on them and skip the bulk byte machinery.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
 use regex::RegexBuilder;
 
 /// Internal separator used by `preprocess_expression_args` (in `main.rs`,
@@ -52,22 +52,14 @@ pub(crate) struct Expression {
 
 pub(crate) struct CompiledExpression {
     pub(crate) regex: regex::Regex,
-    /// Boxed closure form of the replacer. Kept on the struct for symmetry with
-    /// `rep`'s `CompiledExpression` and as a future caller hook (Phase 5
-    /// preview will likely use it for inline-diff rendering); the in-crate
-    /// apply path dispatches through `kind` and the specialised counting
-    /// replacers, never through this field.
-    #[allow(dead_code)]
-    pub(crate) replacer: Box<dyn Fn(&regex::Captures) -> String + Send + Sync>,
-    /// Lets the apply path short-circuit through fast specialised counting
-    /// replacers rather than re-running the boxed closure per match.
+    /// Selects the counting replacer used when applying this expression.
     pub(crate) kind: ReplacerKind,
 }
 
 pub(crate) enum ReplacerKind {
     Literal(String),
     Regex(String),
-    Smart(Arc<HashMap<String, String>>),
+    Smart(HashMap<String, String>),
 }
 
 struct CountingLiteralReplacer<'a> {
@@ -220,25 +212,16 @@ fn parse_expressions(opts: &CompileOptions) -> Result<Vec<Expression>> {
 fn compile_expression(opts: &CompileOptions, expr: &Expression) -> Result<CompiledExpression> {
     if opts.smart {
         let (variant_map, variant_pattern) = build_case_variants(&expr.find, &expr.replace);
+        ensure!(
+            !variant_map.is_empty(),
+            "Invalid smart pattern: no non-empty case variants - use a literal replacement for empty or separator-only patterns"
+        );
         let regex = RegexBuilder::new(&variant_pattern)
             .dot_matches_new_line(false)
             .build()
             .with_context(|| format!("Invalid smart pattern: {}", expr.find))?;
-        let variant_map = Arc::new(variant_map);
-        let closure_map = Arc::clone(&variant_map);
-        let replacer = move |caps: &regex::Captures| -> String {
-            let matched = caps
-                .get(0)
-                .expect("full regex match is always present")
-                .as_str();
-            closure_map
-                .get(matched)
-                .cloned()
-                .expect("smart replacer map must contain every regex alternative")
-        };
         Ok(CompiledExpression {
             regex,
-            replacer: Box::new(replacer),
             kind: ReplacerKind::Smart(variant_map),
         })
     } else {
@@ -252,20 +235,11 @@ fn compile_expression(opts: &CompileOptions, expr: &Expression) -> Result<Compil
             .build()
             .with_context(|| format!("Invalid regex: {}", expr.find))?;
         let kind = if opts.regex {
-            ReplacerKind::Regex(subst.clone())
+            ReplacerKind::Regex(subst)
         } else {
             ReplacerKind::Literal(expr.replace.clone())
         };
-        let replacer = move |caps: &regex::Captures| -> String {
-            let mut out = String::with_capacity(subst.len());
-            caps.expand(&subst, &mut out);
-            out
-        };
-        Ok(CompiledExpression {
-            regex,
-            replacer: Box::new(replacer),
-            kind,
-        })
+        Ok(CompiledExpression { regex, kind })
     }
 }
 
@@ -459,6 +433,37 @@ mod tests {
 
         let (out, _) = apply_to_basename("FooBar_foo_bar_FOO_BAR.rs", &exprs);
         assert_eq!(out, "HelloWorld_hello_world_HELLO_WORLD.rs");
+    }
+
+    #[test]
+    fn smart_rejects_patterns_without_case_variants() {
+        for find in ["", "_", "-", "_--_", " "] {
+            let mut o = opts();
+            o.smart = true;
+            o.positional_find = Some(find.into());
+            o.positional_replace = Some("new".into());
+            let err = compile_expressions(&o)
+                .err()
+                .expect("invalid smart pattern");
+            assert_eq!(
+                err.to_string(),
+                "Invalid smart pattern: no non-empty case variants - use a literal replacement for empty or separator-only patterns"
+            );
+            o.expressions = vec![expr_arg("valid", "replacement"), expr_arg(find, "new")];
+            assert!(compile_expressions(&o).is_err());
+        }
+    }
+
+    #[test]
+    fn smart_empty_replacement_deletes_case_variants() {
+        let mut o = opts();
+        o.smart = true;
+        o.expressions = vec![expr_arg("foo_bar", "")];
+        let exprs = compile_expressions(&o).unwrap();
+        assert_eq!(
+            apply_to_basename("FooBar_foo_bar_FOO_BAR.rs", &exprs),
+            ("__.rs".into(), 3)
+        );
     }
 
     #[test]
