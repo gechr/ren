@@ -1,6 +1,6 @@
 //! End-to-end integration tests for the `ren` binary.
 //!
-//! These complement the unit tests in `src/main.rs` and the per-module test
+//! These complement the unit tests in the individual modules and test
 //! suites by exercising the binary as a whole: argument parsing → walker →
 //! plan build → validate → apply (or dry-run / list-files / preview-stub).
 //! The binary is located by `assert_cmd::Command::cargo_bin("ren")`.
@@ -111,6 +111,100 @@ fn include_dirs_with_recursive_renames_dir_then_nested_file() {
     assert!(dir.path().join("qux_dir").is_dir());
     assert!(dir.path().join("qux_dir/qux_inner.txt").exists());
     assert!(!dir.path().join("foo_dir").exists());
+}
+
+#[test]
+fn nested_directory_summary_uses_source_types_before_renaming() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("foo_parent/foo_child")).unwrap();
+    ren(&dir)
+        .args(["-W", "-D", "-R", "foo", "bar"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Renamed 2 directories"));
+    assert!(dir.path().join("bar_parent/bar_child").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_is_graceful_for_help_listing_and_apply() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("old.txt"), "data").unwrap();
+    for args in [vec!["--help"], vec!["-l"], vec!["-W", "old", "new"]] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        ren(&dir)
+            .args(args)
+            .stdout(OwnedFd::from(writer))
+            .assert()
+            .success()
+            .stderr("");
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "data"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_does_not_hide_invalid_input_paths() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("file.txt"), "data").unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    ren(&dir)
+        .args(["-l", "", ".", "missing"])
+        .stdout(OwnedFd::from(writer))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1 path could not be processed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_preserves_failures_and_independent_renames() {
+    use std::io::Write as _;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("old.txt"), "data").unwrap();
+    for (args, code) in [(vec!["--unknown-option"], 2), (vec!["old"], 1)] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        ren(&dir)
+            .args(args)
+            .stderr(OwnedFd::from(writer))
+            .assert()
+            .code(code);
+    }
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let mut child = ren(&dir)
+        .args(["-W", "old", "new"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(OwnedFd::from(writer))
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"old.txt\nmissing\n")
+        .unwrap();
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "data"
+    );
 }
 
 #[test]
@@ -788,6 +882,99 @@ fn malformed_ignore_warns_without_failing_valid_renames() {
         .success()
         .stderr(predicate::str::contains("Warning:"));
     assert!(dir.path().join("bar.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_during_warnings_still_processes_valid_files() {
+    use std::os::fd::OwnedFd;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join(".ignore"), "{a,b\n").unwrap();
+    // APFS rejects invalid UTF-8 basenames before ren can discover them.
+    #[cfg(target_os = "linux")]
+    let invalid = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.txt"));
+    #[cfg(target_os = "linux")]
+    fs::write(&invalid, "unchanged").unwrap();
+    fs::write(dir.path().join("foo.txt"), "content").unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    ren(&dir)
+        .args(["-W", "foo", "bar", "."])
+        .stderr(OwnedFd::from(writer))
+        .assert()
+        .code(1);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("bar.txt")).unwrap(),
+        "content"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(fs::read_to_string(invalid).unwrap(), "unchanged");
+}
+
+#[test]
+fn relocation_parent_collision_fails_before_creating_directories() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("photos/x")).unwrap();
+    fs::create_dir_all(dir.path().join("photos/y")).unwrap();
+    fs::write(dir.path().join("photos/y/z"), "content").unwrap();
+    ren(&dir)
+        .args([
+            "-W",
+            "-R",
+            "-D",
+            "-d",
+            "out",
+            "--parents",
+            "-e",
+            "x",
+            "y",
+            "-e",
+            "z",
+            "w",
+            "photos",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "also required as a parent directory",
+        ));
+    assert!(!dir.path().join("out").exists());
+    assert!(dir.path().join("photos/x").is_dir());
+    assert!(dir.path().join("photos/y/z").is_file());
+}
+
+#[test]
+fn parent_alias_collisions_leave_no_created_directories() {
+    for target in ["out/Y/w", "out/y/../w"] {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("x"), "first").unwrap();
+        fs::write(dir.path().join("z"), "second").unwrap();
+        ren(&dir)
+            .args([
+                "-W",
+                "--create-dirs",
+                "-e",
+                "x",
+                "out/y",
+                "-e",
+                "z",
+                target,
+                "x",
+                "z",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "also required as a parent directory",
+            ));
+        assert!(!dir.path().join("out").exists());
+        assert_eq!(fs::read_to_string(dir.path().join("x")).unwrap(), "first");
+        assert_eq!(fs::read_to_string(dir.path().join("z")).unwrap(), "second");
+    }
 }
 
 #[cfg(unix)]

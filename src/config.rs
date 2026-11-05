@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Clone, Default)]
@@ -98,24 +99,24 @@ pub struct Config {
 }
 
 impl Config {
-    pub(crate) fn load(env: &Environment) -> Self {
+    pub(crate) fn load(env: &Environment, diagnostics: &mut impl Write) -> std::io::Result<Self> {
         let Some(path) = resolve_path(env) else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        match std::fs::read_to_string(&path) {
+        Ok(match std::fs::read_to_string(&path) {
             Ok(body) => match toml::from_str(&body) {
                 Ok(config) => config,
                 Err(err) => {
-                    eprintln!("ren: {}: {err}", path.display());
+                    writeln!(diagnostics, "ren: {}: {err}", path.display())?;
                     Self::default()
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(err) => {
-                eprintln!("ren: failed to read {}: {err}", path.display());
+                writeln!(diagnostics, "ren: failed to read {}: {err}", path.display())?;
                 Self::default()
             }
-        }
+        })
     }
 
     pub(crate) fn values(&self) -> HashMap<&'static str, OsString> {

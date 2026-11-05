@@ -132,6 +132,14 @@ The pipeline runs in fixed canonical order regardless of argv order:
 
 By default the pipeline runs on the file stem only and the extension is reattached afterward - this prevents accidents like `ren txt notes` rewriting `report.txt` to `report.notes`. `-x/--include-extension` opts back into matching the full basename, and `-X/--only-extension` flips the split so the pipeline runs on the extension only and the stem is preserved verbatim. `-E/--change-extension <ext>` is orthogonal: it overrides the reattached extension while the rest of the pipeline still runs on the stem, so it composes with `--supplant` and friends (`ren -s '{n:02}' -E png` → `01.png`, `02.png`, …). A leading dot is optional, files without an extension gain one, and an empty value (`-E ''`) strips it; the whole extension is replaced, including compound ones (`archive.tar.gz` → `archive.zip`). It is mutually exclusive with `-x`/`-X`. Counter indexes reset per parent directory - with `--recursive`, each directory starts at `1` (or `01`, `001`, … with a width specifier). Files filtered out by find/replace don't consume a counter slot.
 
+## Configuration
+
+Defaults load from `$XDG_CONFIG_HOME/ren/config.toml`, or `~/.config/ren/config.toml` when XDG is unset. `REN_CONFIG_PATH` selects another file; an empty value disables configuration. TOML keys use long-option names such as `recursive`, `include-dirs`, and `change-extension`. An empty `change-extension` strips extensions.
+
+Explicit CLI arguments override `REN_*` environment defaults, which override TOML defaults. For example, `--recursive` overrides `REN_RECURSIVE`, and `--change-extension` overrides `REN_CHANGE_EXTENSION`. Sources are resolved from one environment snapshot without changing the process environment.
+
+Transform defaults also make bare positional arguments paths. Use `-e FIND REPLACE` for find/replace expressions when transforms are enabled through configuration or environment defaults.
+
 ## Preview keymap
 
 `ren --preview` walks each plan entry and asks for a decision:
@@ -154,3 +162,7 @@ Renames use two stages within each depth group: sources move to temporary names,
 Placement and recovery refuse to overwrite occupied paths, including destinations created after the initial checks. This requires native exclusive rename support on Linux, macOS, or Windows; other platforms fail safely. Filesystems that cannot provide the operation also fail. Cross-filesystem moves and durability after power loss are not supported guarantees.
 
 Overlapping roots and aliases of the same directory entry are processed once; separate hard links remain separate entries. The first supplied root determines `--parents` layout. Every explicit root argument is checked before processing begins; an invalid root prevents all renames. Missing stdin inputs and errors encountered within a walk produce a failing exit status after valid inputs are processed. Malformed ignore-file rules produce warnings. VCS metadata directories remain excluded with `--no-ignore`.
+
+Required parent directories are checked before any are created. A planned destination cannot also be a directory needed by another rename. Directories created for an otherwise valid plan may remain after an apply failure.
+
+Stdout is buffered and explicitly flushed; diagnostics are written by line. Closing a stdout pipe early is graceful; other output failures and invalid inputs retain a failing exit status. Output errors after applying a plan do not undo completed renames.

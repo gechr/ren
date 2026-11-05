@@ -119,8 +119,8 @@ fn split_stem_ext(basename: &str) -> (&str, Option<&str>) {
 
 /// Build a rename plan from walked records and compiled expressions.
 ///
-/// Non-UTF-8 basenames are warned and skipped (parity with `rep`'s permissive
-/// philosophy). Records whose basename does not change after applying every
+/// Non-UTF-8 basenames are skipped (the runtime reports them to the user).
+/// Records whose basename does not change after applying every
 /// expression - including those with zero matches - are filtered out.
 ///
 /// The output preserves the input order. `walk_paths` already sorts records
@@ -173,10 +173,6 @@ pub(crate) fn build_plan(
 
     for record in records {
         let Some(basename) = record.path.file_name().and_then(|n| n.to_str()) else {
-            eprintln!(
-                "warning: {}: skipping (non-UTF-8 basename)",
-                record.path.display()
-            );
             continue;
         };
         let parent = if uses_counter {

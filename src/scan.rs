@@ -42,15 +42,15 @@ pub(crate) struct PathRecord {
 pub(crate) struct Discovery {
     pub(crate) records: Vec<PathRecord>,
     pub(crate) errors: Vec<Error>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Build a `WalkBuilder` configured with the supplied roots and (optional)
 /// glob override set.
 ///
 /// `recursive == false` clamps the walk to depth 1 (the root and its direct
-/// children). `follow_links(false)` is unconditional - `ren` operates on the
-/// link itself, not its target, and dangling symlinks should still surface
-/// rather than being silently skipped.
+/// children). Walked symlinks are excluded and never traversed. Explicit stdin
+/// entries can still name symlinks for renaming the link itself.
 pub(crate) fn walk_builder(
     dirs: Vec<&Path>,
     file_set: Option<FileSet>,
@@ -215,7 +215,7 @@ pub(crate) fn walk_paths(
                 }
             };
             if let Some(error) = dirent.error() {
-                eprintln!("Warning: {error}");
+                found.warnings.push(error.to_string());
             }
             let path = dirent.path();
             if dirent.depth() > 0 && !is_candidate_path(path) {

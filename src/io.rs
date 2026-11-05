@@ -87,6 +87,7 @@ pub(crate) fn records_from_paths(paths: Vec<PathBuf>) -> Discovery {
     let mut found = Discovery {
         records,
         errors: Vec::new(),
+        warnings: Vec::new(),
     };
     finish_discovery(&mut found, true);
     found
